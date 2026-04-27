@@ -1,0 +1,13 @@
+name = "InfinitePE"
+uuid = "8f2382be-06de-4fd5-b9ab-9eaf2f52df35"
+authors = ["Codex"]
+version = "0.1.0"
+
+[compat]
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
