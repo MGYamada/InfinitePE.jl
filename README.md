@@ -9,6 +9,13 @@ baseline temperature scan:
 julia --project=. scripts/edmc_prl113197205_baseline.jl
 ```
 
+Full ED and Fig. 5-style plotting baselines are also available:
+
+```sh
+julia --project=. scripts/fulled_prl113197205_baseline.jl
+julia --project=. scripts/plot_prl113197205_fig5.jl
+```
+
 The defaults use a small honeycomb lattice (`Lx=2`, `Ly=2`) with short warmup
 and sampling runs, so they are meant only to check qualitative trends such as
 the energy curve and specific-heat peak shape. A custom scan can be started as:

@@ -134,3 +134,19 @@ end
     @test_throws ArgumentError EDMC.scan_temperatures(input, Float64[]; sampling_sweeps=1, seed=1)
     @test_throws ArgumentError EDMC.scan_temperatures(input, [1.0, 0.0]; sampling_sweeps=1, seed=1)
 end
+
+@testset "EDMC Majorana energy convention" begin
+    lat = generate_honeycomb(1, 1, TypeI())
+    input = EDMC.lattice_to_edmc(lat)
+    couplings = (x=0.0, y=0.0, z=1.0)
+
+    result = EDMC.diagonalize(EDMC.build_hamiltonian(input; couplings=couplings))
+    @test result.eigenvalues == [-1.0, 1.0]
+    @test EDMC.majorana_energies(result) == [2.0]
+
+    beta = 1.7
+    edmc_obs = EDMC.measure(input, beta; couplings=couplings)
+    fulled_obs = FullED.thermal_observables(FullED.lattice_to_fulled(lat), beta; couplings=couplings)
+    @test edmc_obs.energy ≈ fulled_obs.energy
+    @test edmc_obs.specific_heat ≈ fulled_obs.specific_heat
+end
