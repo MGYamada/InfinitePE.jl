@@ -27,9 +27,9 @@ using SparseArrays
 
     @test sparse_pseudofermion_action(sparse_a, beta, sparse_fields; solver=:direct) ≈
           pseudofermion_action(dense_a, beta, sparse_fields)
-    @test sparse_pseudofermion_action(sparse_a, beta, sparse_fields; solver=:gmres, operator=:matrix) ≈
+    @test sparse_pseudofermion_action(sparse_a, beta, sparse_fields; solver=:cg, operator=:matrix) ≈
           sparse_pseudofermion_action(sparse_a, beta, sparse_fields; solver=:direct) atol = 1e-9
-    @test sparse_pseudofermion_action(sparse_a, beta, sparse_fields; solver=:gmres, operator=:matrix_free) ≈
+    @test sparse_pseudofermion_action(sparse_a, beta, sparse_fields; solver=:cg, operator=:matrix_free) ≈
           sparse_pseudofermion_action(sparse_a, beta, sparse_fields; solver=:direct) atol = 1e-9
     @test sparse_pseudofermion_action(input, beta, sparse_fields) ≈
           pseudofermion_action(input, beta, sparse_fields)
@@ -49,7 +49,7 @@ using SparseArrays
         warmup_sweeps=1,
         sampling_sweeps=2,
         seed=456,
-        solver=:gmres,
+        solver=:cg,
         operator=:matrix_free,
     )
     run2 = run_sparse_pseudofermion_mc(
@@ -59,7 +59,7 @@ using SparseArrays
         warmup_sweeps=1,
         sampling_sweeps=2,
         seed=456,
-        solver=:gmres,
+        solver=:cg,
         operator=:matrix_free,
     )
     @test run1.samples == run2.samples
@@ -69,6 +69,26 @@ using SparseArrays
     @test run1.accepted == run1.warmup_accepted + run1.sampling_accepted
     @test 0.0 <= run1.acceptance_rate <= 1.0
 
+    scan = scan_sparse_pseudofermion_temperatures(
+        input,
+        [0.8, 1.6];
+        cutoff=2,
+        warmup_sweeps=1,
+        sampling_sweeps=2,
+        seed=789,
+        solver=:cg,
+        operator=:matrix_free,
+    )
+    rows = sparse_pseudofermion_comparison_table(scan; metadata=(observable="EDMC-compatible",))
+    @test scan.temperatures == [0.8, 1.6]
+    @test length(scan.observables) == 2
+    @test length(scan.runs) == 2
+    @test rows[1].method == :SparsePseudofermionIPE
+    @test rows[1].metadata.cutoff == 2
+    @test rows[1].metadata.solver == :cg
+    @test rows[1].metadata.operator == :matrix_free
+    @test all(row -> isfinite(row.energy_per_site) && isfinite(row.specific_heat_per_site), rows)
+
     @test_throws ArgumentError refresh_sparse_real_pseudofermions(sparse_a, beta; cutoff=0)
     @test_throws ArgumentError sparse_pseudofermion_action(sparse_a, beta, Vector{Float64}[])
     @test_throws ArgumentError sparse_pseudofermion_action(sparse_a, beta, [[1.0]])
@@ -76,4 +96,5 @@ using SparseArrays
     @test_throws ArgumentError sparse_pseudofermion_action(sparse_a, beta, sparse_fields; operator=:unknown)
     @test_throws ArgumentError run_sparse_pseudofermion_mc(input, beta; cutoff=0, sampling_sweeps=1)
     @test_throws ArgumentError run_sparse_pseudofermion_mc(input, beta; cutoff=1, sampling_sweeps=1, seed=1, rng=MersenneTwister(1))
+    @test_throws ArgumentError scan_sparse_pseudofermion_temperatures(input, Float64[]; cutoff=1, sampling_sweeps=1)
 end

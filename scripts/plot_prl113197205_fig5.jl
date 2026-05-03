@@ -20,10 +20,22 @@ Options:
   --Jy FLOAT                           Kitaev y coupling [0.3333333333333333]
   --Jz FLOAT                           Kitaev z coupling [0.3333333333333333]
   --sign FLOAT                         Overall Full ED sign in H=sign*sum(Jσσ) [-1.0]
+  --include-fulled true|false          Include Full ED baseline [true]
   --include-edmc true|false            Overlay EDMC comparison curve [true]
+  --include-pseudofermion true|false   Overlay pseudofermion IPE curve [true]
   --warmup INT                         EDMC warmup sweeps per temperature [20]
   --sampling INT                       EDMC sampling sweeps per temperature [80]
   --seed INT                           EDMC RNG seed [113197205]
+  --pf-warmup INT                      Pseudofermion warmup sweeps per temperature [warmup]
+  --pf-sampling INT                    Pseudofermion sampling sweeps per temperature [sampling]
+  --pf-seed INT                        Pseudofermion RNG seed [seed]
+  --pf-backend dense|sparse            Pseudofermion backend [dense]
+  --pf-solver cg|direct                Sparse pseudofermion solver [cg]
+  --pf-operator matrix_free|matrix      Sparse CG normal operator [matrix_free]
+  --pf-tol FLOAT                       Sparse solver tolerance [1e-10]
+  --pf-maxiter INT                     Sparse solver max iterations [1000]
+  --pf-krylovdim INT                   Sparse solver Krylov dimension [30]
+  --cutoff INT                         Matsubara cutoff for pseudofermion IPE [8]
   --output PATH                        Figure output path [prl113197205_fig5_fulled.png]
   --csv PATH                           Optional CSV output path for plotted data
   --help                               Show this message
@@ -66,6 +78,12 @@ function get_bool(opts, key, default)
     throw(ArgumentError("--$key must be true or false; got $value"))
 end
 
+function get_symbol(opts, key, default, allowed)
+    value = Symbol(get(opts, key, string(default)))
+    value in allowed || throw(ArgumentError("--$key must be one of $(join(string.(allowed), ", ")); got :$value"))
+    return value
+end
+
 function temperatures_from_options(opts)
     if haskey(opts, "temps")
         temps = [parse(Float64, strip(part)) for part in split(opts["temps"], ",") if !isempty(strip(part))]
@@ -94,19 +112,25 @@ function csv_escape(value)
     return text
 end
 
-function write_plot_csv(path, temperatures, fulled_cv, edmc_cv, edmc_cv_error)
+function write_plot_csv(path, temperatures, fulled_cv, edmc_cv, edmc_cv_error, pf_cv, pf_cv_error)
     open(path, "w") do io
-        println(io, "temperature,fulled_specific_heat_per_site,edmc_specific_heat_per_site,edmc_specific_heat_jackknife_error")
+        println(
+            io,
+            "temperature,fulled_specific_heat_per_site,edmc_specific_heat_per_site,edmc_specific_heat_jackknife_error,pseudofermion_specific_heat_per_site,pseudofermion_specific_heat_jackknife_error",
+        )
         for i in eachindex(temperatures)
+            fulled_value = fulled_cv === nothing ? "" : fulled_cv[i]
             edmc_value = edmc_cv === nothing ? "" : edmc_cv[i]
             edmc_error = edmc_cv_error === nothing ? "" : edmc_cv_error[i]
-            println(io, join(csv_escape.((temperatures[i], fulled_cv[i], edmc_value, edmc_error)), ","))
+            pf_value = pf_cv === nothing ? "" : pf_cv[i]
+            pf_error = pf_cv_error === nothing ? "" : pf_cv_error[i]
+            println(io, join(csv_escape.((temperatures[i], fulled_value, edmc_value, edmc_error, pf_value, pf_error)), ","))
         end
     end
     return path
 end
 
-function make_plot(temperatures, fulled_cv, edmc_cv, edmc_cv_error; title, output)
+function make_plot(temperatures, fulled_cv, edmc_cv, edmc_cv_error, pf_cv, pf_cv_error; title, output)
     default(
         framestyle=:box,
         grid=false,
@@ -118,18 +142,23 @@ function make_plot(temperatures, fulled_cv, edmc_cv, edmc_cv_error; title, outpu
         titlefontsize=11,
     )
 
-    main = plot(
-        temperatures,
-        fulled_cv;
-        label="Full ED",
-        color=:black,
-        marker=:circle,
+    main = plot(;
         xlabel="T",
         ylabel="Cv",
         title=title,
         xscale=:log10,
         xlims=(minimum(temperatures), maximum(temperatures)),
     )
+    if fulled_cv !== nothing
+        plot!(
+            main,
+            temperatures,
+            fulled_cv;
+            label="Full ED",
+            color=:black,
+            marker=:circle,
+        )
+    end
     if edmc_cv !== nothing
         plot!(
             main,
@@ -142,20 +171,36 @@ function make_plot(temperatures, fulled_cv, edmc_cv, edmc_cv_error; title, outpu
             linestyle=:dash,
         )
     end
+    if pf_cv !== nothing
+        plot!(
+            main,
+            temperatures,
+            pf_cv;
+            yerror=pf_cv_error,
+            label="Pseudofermion IPE",
+            color=:blue,
+            marker=:diamond,
+            linestyle=:dot,
+        )
+    end
 
-    positive_fulled = max.(fulled_cv, eps(Float64))
-    inset = plot(
-        temperatures,
-        positive_fulled;
-        label="Full ED",
-        color=:black,
-        marker=:circle,
+    inset = plot(;
         xlabel="T",
         ylabel="Cv",
         xscale=:log10,
         yscale=:log10,
         legend=:bottomright,
     )
+    if fulled_cv !== nothing
+        plot!(
+            inset,
+            temperatures,
+            max.(fulled_cv, eps(Float64));
+            label="Full ED",
+            color=:black,
+            marker=:circle,
+        )
+    end
     if edmc_cv !== nothing
         plot!(
             inset,
@@ -166,6 +211,18 @@ function make_plot(temperatures, fulled_cv, edmc_cv, edmc_cv_error; title, outpu
             color=:red,
             marker=:utriangle,
             linestyle=:dash,
+        )
+    end
+    if pf_cv !== nothing
+        plot!(
+            inset,
+            temperatures,
+            max.(pf_cv, eps(Float64));
+            yerror=pf_cv_error,
+            label="Pseudofermion IPE",
+            color=:blue,
+            marker=:diamond,
+            linestyle=:dot,
         )
     end
 
@@ -216,12 +273,71 @@ function edmc_specific_heat_jackknife(input, beta, samples; couplings=(x=1.0, y=
     return estimate, sqrt(max(0.0, variance))
 end
 
+function pseudofermion_specific_heat_jackknife(input, beta, samples; couplings=(x=1.0, y=1.0, z=1.0), atol=1e-10)
+    gauge_samples = [EDMC.Z2GaugeField(sample) for sample in samples]
+    return edmc_specific_heat_jackknife(input, beta, gauge_samples; couplings=couplings, atol=atol)
+end
+
+function pseudofermion_scan(
+    input,
+    temperatures;
+    backend::Symbol,
+    cutoff::Integer,
+    warmup_sweeps::Integer,
+    sampling_sweeps::Integer,
+    seed,
+    couplings,
+    solver::Symbol,
+    operator::Symbol,
+    tol::Real,
+    maxiter::Integer,
+    krylovdim::Integer,
+)
+    if backend === :dense
+        return scan_pseudofermion_temperatures(
+            input,
+            temperatures;
+            cutoff=cutoff,
+            warmup_sweeps=warmup_sweeps,
+            sampling_sweeps=sampling_sweeps,
+            seed=seed,
+            couplings=couplings,
+        )
+    elseif backend === :sparse
+        return scan_sparse_pseudofermion_temperatures(
+            input,
+            temperatures;
+            cutoff=cutoff,
+            warmup_sweeps=warmup_sweeps,
+            sampling_sweeps=sampling_sweeps,
+            seed=seed,
+            couplings=couplings,
+            solver=solver,
+            operator=operator,
+            tol=tol,
+            maxiter=maxiter,
+            krylovdim=krylovdim,
+        )
+    end
+    throw(ArgumentError("unsupported pseudofermion backend :$backend"))
+end
+
 function _specific_heat_from_sums(energy_sum, energy2_sum, derivative_sum, nsamples, beta, nsites)
     mean_energy = energy_sum / nsamples
     mean_energy2 = energy2_sum / nsamples
     mean_derivative = derivative_sum / nsamples
     specific_heat = beta^2 * (mean_energy2 - mean_energy^2 - mean_derivative) / nsites
     return max(0.0, specific_heat)
+end
+
+function coupling_label(couplings)
+    if couplings.x == couplings.y == couplings.z
+        if couplings.x ≈ 1 / 3
+            return "J=1/3"
+        end
+        return "J=$(round(couplings.x; sigdigits=4))"
+    end
+    return "J=($(round(couplings.x; sigdigits=3)),$(round(couplings.y; sigdigits=3)),$(round(couplings.z; sigdigits=3)))"
 end
 
 function main(args)
@@ -237,20 +353,25 @@ function main(args)
     sign = get_float(opts, "sign", -1.0)
     output = get_string(opts, "output", "prl113197205_fig5_fulled.png")
     csv = get(opts, "csv", nothing)
+    include_fulled = get_bool(opts, "include-fulled", true)
     include_edmc = get_bool(opts, "include-edmc", true)
+    include_pseudofermion = get_bool(opts, "include-pseudofermion", true)
 
     lat = generate_honeycomb(L, L, TypeII())
-    fulled_input = FullED.lattice_to_fulled(lat)
-    fulled_scan = FullED.scan_temperatures(fulled_input, temperatures; couplings=couplings, sign=sign)
-    fulled_cv = [obs.specific_heat for obs in fulled_scan.observables]
+    fulled_cv = nothing
+    if include_fulled
+        fulled_input = FullED.lattice_to_fulled(lat)
+        fulled_scan = FullED.scan_temperatures(fulled_input, temperatures; couplings=couplings, sign=sign)
+        fulled_cv = [obs.specific_heat for obs in fulled_scan.observables]
+    end
 
     edmc_cv = nothing
     edmc_cv_error = nothing
+    warmup = get_int(opts, "warmup", 20)
+    sampling = get_int(opts, "sampling", 80)
+    seed = get_int(opts, "seed", 113197205)
+    edmc_input = EDMC.lattice_to_edmc(lat)
     if include_edmc
-        warmup = get_int(opts, "warmup", 20)
-        sampling = get_int(opts, "sampling", 80)
-        seed = get_int(opts, "seed", 113197205)
-        edmc_input = EDMC.lattice_to_edmc(lat)
         edmc_scan = EDMC.scan_temperatures(
             edmc_input,
             temperatures;
@@ -267,14 +388,56 @@ function main(args)
         edmc_cv_error = last.(estimates)
     end
 
-    title = "Honeycomb Type-II, N=$(lat.nsites), Jx=Jy=Jz=$(couplings.x)"
-    make_plot(temperatures, fulled_cv, edmc_cv, edmc_cv_error; title=title, output=output)
-    csv !== nothing && write_plot_csv(csv, temperatures, fulled_cv, edmc_cv, edmc_cv_error)
+    pf_cv = nothing
+    pf_cv_error = nothing
+    cutoff = get_int(opts, "cutoff", 8)
+    if include_pseudofermion
+        pf_warmup = get_int(opts, "pf-warmup", warmup)
+        pf_sampling = get_int(opts, "pf-sampling", sampling)
+        pf_seed = get_int(opts, "pf-seed", seed)
+        pf_backend = get_symbol(opts, "pf-backend", :dense, (:dense, :sparse))
+        pf_solver = get_symbol(opts, "pf-solver", :cg, (:cg, :direct))
+        pf_operator = get_symbol(opts, "pf-operator", :matrix_free, (:matrix_free, :matrix))
+        pf_tol = get_float(opts, "pf-tol", 1e-10)
+        pf_maxiter = get_int(opts, "pf-maxiter", 1000)
+        pf_krylovdim = get_int(opts, "pf-krylovdim", 30)
+        pf_scan = pseudofermion_scan(
+            edmc_input,
+            temperatures;
+            backend=pf_backend,
+            cutoff=cutoff,
+            warmup_sweeps=pf_warmup,
+            sampling_sweeps=pf_sampling,
+            seed=pf_seed,
+            couplings=couplings,
+            solver=pf_solver,
+            operator=pf_operator,
+            tol=pf_tol,
+            maxiter=pf_maxiter,
+            krylovdim=pf_krylovdim,
+        )
+        estimates = [
+            pseudofermion_specific_heat_jackknife(edmc_input, inv(Float64(temperature)), run.samples; couplings=couplings)
+            for (temperature, run) in zip(temperatures, pf_scan.runs)
+        ]
+        pf_cv = first.(estimates)
+        pf_cv_error = last.(estimates)
+    end
+
+    title = "Type-II honeycomb, N=$(lat.nsites), $(coupling_label(couplings)), cutoff=$cutoff"
+    make_plot(temperatures, fulled_cv, edmc_cv, edmc_cv_error, pf_cv, pf_cv_error; title=title, output=output)
+    csv !== nothing && write_plot_csv(csv, temperatures, fulled_cv, edmc_cv, edmc_cv_error, pf_cv, pf_cv_error)
 
     println("wrote figure: $output")
     csv !== nothing && println("wrote plotted data CSV: $csv")
     println("lattice=$(lat.kind), dims=$(lat.dims), nsites=$(lat.nsites), temperatures=$(length(temperatures))")
+    println("include_fulled=$include_fulled")
     println("include_edmc=$include_edmc")
+    if include_pseudofermion
+        println("include_pseudofermion=$include_pseudofermion, backend=$(get(opts, "pf-backend", "dense")), cutoff=$cutoff")
+    else
+        println("include_pseudofermion=false")
+    end
     return output
 end
 
