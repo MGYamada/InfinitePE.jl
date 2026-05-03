@@ -133,10 +133,40 @@ end
     @test pf_mean_logw ≈ exact_mean_logw atol = 0.06
     @test det_mean_logw ≈ pf_mean_logw atol = 0.06
 
+    temperatures = [0.8, 1.6]
+    edmc_scan = EDMC.scan_temperatures(
+        mc_input,
+        temperatures;
+        warmup_sweeps=5,
+        sampling_sweeps=25,
+        seed=21,
+    )
+    pf_scan = scan_pseudofermion_temperatures(
+        mc_input,
+        temperatures;
+        cutoff=mc_cutoff,
+        warmup_sweeps=5,
+        sampling_sweeps=25,
+        seed=21,
+    )
+    pf_rows = pseudofermion_comparison_table(pf_scan; metadata=(observable="EDMC-compatible",))
+    edmc_rows = EDMC.comparison_table(edmc_scan)
+
+    @test pf_scan.temperatures == edmc_scan.temperatures
+    @test length(pf_scan.observables) == length(edmc_scan.observables)
+    @test all(run -> 0.0 <= run.acceptance_rate <= 1.0, pf_scan.runs)
+    @test pf_rows[1].method == :PseudofermionIPE
+    @test pf_rows[1].metadata.cutoff == mc_cutoff
+    @test pf_rows[1].metadata.observable == "EDMC-compatible"
+    @test keys(pf_rows[1]) == keys(edmc_rows[1])
+    @test all(row -> isfinite(row.energy_per_site) && isfinite(row.specific_heat_per_site), pf_rows)
+
     @test_throws ArgumentError matsubara_frequency(-1, beta)
     @test_throws ArgumentError log_weight(a, beta; cutoff=0)
     @test_throws ArgumentError log_weight([0.0 1.0; 1.0 0.0], beta; cutoff=cutoff)
     @test_throws ArgumentError refresh_real_pseudofermions(a, beta; cutoff=0)
     @test_throws ArgumentError pseudofermion_action(a, beta, Vector{Float64}[])
     @test_throws ArgumentError pseudofermion_action(a, beta, [[1.0]])
+    @test_throws ArgumentError run_pseudofermion_mc(mc_input, mc_beta; cutoff=0, sampling_sweeps=1)
+    @test_throws ArgumentError run_pseudofermion_mc(mc_input, mc_beta; cutoff=1, sampling_sweeps=1, seed=1, rng=MersenneTwister(1))
 end

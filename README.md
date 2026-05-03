@@ -16,6 +16,25 @@ julia --project=. scripts/fulled_prl113197205_baseline.jl
 julia --project=. scripts/plot_prl113197205_fig5.jl
 ```
 
+For a more stable Fig. 5-like comparison overlaying Full ED, EDMC, and the
+pseudofermion Infinite Product Expansion, use:
+
+```sh
+julia --project=. scripts/plot_prl113197205_fig5.jl \
+  --ntemps 40 \
+  --warmup 1000 \
+  --sampling 10000 \
+  --output fig5_like.png \
+  --csv fig5_like.csv \
+  --cutoff 32
+```
+
+This produces the Type-II honeycomb `N=8`, `Jx=Jy=Jz=1/3` specific-heat
+comparison. The pseudofermion IPE curve uses a finite Matsubara cutoff and is
+measured with the same EDMC-compatible observable convention as the EDMC
+samples. The generated `fig5_like.png` overlays Full ED, EDMC, and
+pseudofermion IPE, while `fig5_like.csv` records the plotted data.
+
 The defaults use a small honeycomb lattice (`Lx=2`, `Ly=2`) with short warmup
 and sampling runs, so they are meant only to check qualitative trends such as
 the energy curve and specific-heat peak shape. A custom scan can be started as:
