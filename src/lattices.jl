@@ -1,9 +1,9 @@
 abstract type BoundaryType end
 
-"Type-I boundary condition."
+"Type-I boundary condition: open along a and periodic along b."
 struct TypeI <: BoundaryType end
 
-"Type-II boundary condition."
+"Type-II boundary condition: shifted periodic along a, periodic along b, with one omitted x bond."
 struct TypeII <: BoundaryType end
 
 Base.@kwdef struct SiteCoord
@@ -44,19 +44,19 @@ function _cell_index(x::Int, y::Int, z::Int, sublattice::Int, dims::NTuple{3,Int
 end
 
 function _honeycomb_periodicity(::TypeI)
-    return (true, false, false)
+    return (false, true, false)
 end
 
 function _honeycomb_periodicity(::TypeII)
-    return (true, true, false)
+    return (false, true, false)
 end
 
 function _hyperhoneycomb_periodicity(::TypeI)
-    return (true, false, false)
+    return (false, false, true)
 end
 
 function _hyperhoneycomb_periodicity(::TypeII)
-    return (true, true, true)
+    throw(ArgumentError("Type-II boundary condition is only defined for honeycomb lattices"))
 end
 
 function generate_honeycomb(Lx::Int, Ly::Int, bc::BoundaryType)
@@ -72,11 +72,7 @@ function generate_honeycomb(Lx::Int, Ly::Int, bc::BoundaryType)
         b = SiteCoord(x=x, y=y, z=1, sublattice=2)
         push!(edges, BondEdge(src=a, dst=b, bond=:z, wrapped=false))
 
-        nx, wx = _neighbor_index(x - 1, Lx, px)
-        if nx !== nothing
-            xb = SiteCoord(x=nx, y=y, z=1, sublattice=2)
-            push!(edges, BondEdge(src=a, dst=xb, bond=:x, wrapped=wx))
-        end
+        _push_honeycomb_x_bond!(edges, a, x, y, Lx, Ly, bc, px)
 
         ny, wy = _neighbor_index(y - 1, Ly, py)
         if ny !== nothing
@@ -86,6 +82,26 @@ function generate_honeycomb(Lx::Int, Ly::Int, bc::BoundaryType)
     end
 
     return Lattice(kind=:honeycomb, dims=dims, boundary=typeof(bc), nsites=2 * Lx * Ly, edges=edges)
+end
+
+function _push_honeycomb_x_bond!(edges::Vector{BondEdge}, a::SiteCoord, x::Int, y::Int, Lx::Int, Ly::Int, ::TypeI, px::Bool)
+    nx, wx = _neighbor_index(x - 1, Lx, px)
+    if nx !== nothing
+        xb = SiteCoord(x=nx, y=y, z=1, sublattice=2)
+        push!(edges, BondEdge(src=a, dst=xb, bond=:x, wrapped=wx))
+    end
+    return edges
+end
+
+function _push_honeycomb_x_bond!(edges::Vector{BondEdge}, a::SiteCoord, x::Int, y::Int, Lx::Int, Ly::Int, ::TypeII, px::Bool)
+    if x > 1
+        xb = SiteCoord(x=x - 1, y=y, z=1, sublattice=2)
+        push!(edges, BondEdge(src=a, dst=xb, bond=:x, wrapped=false))
+    elseif y != 1
+        xb = SiteCoord(x=Lx, y=mod1(y + 1, Ly), z=1, sublattice=2)
+        push!(edges, BondEdge(src=a, dst=xb, bond=:x, wrapped=true))
+    end
+    return edges
 end
 
 function generate_hyperhoneycomb(Lx::Int, Ly::Int, Lz::Int, bc::BoundaryType)

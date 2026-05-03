@@ -28,9 +28,9 @@ Options:
   --csv PATH                           Optional CSV output path for plotted data
   --help                               Show this message
 
-Defaults follow the benchmark caption: honeycomb lattice, Type-II boundary,
-2 x L^2 sites with L=2, and Jx=Jy=Jz=1/3. The right panel is the log-log
-inset content shown as a separate panel for readability.
+Defaults follow the Fig. 8(b) Type-II honeycomb boundary used by the benchmark:
+2 x L^2 sites with L=2, and Jx=Jy=Jz=1/3. The right panel is the log-log inset
+content shown as a separate panel for readability.
 """
 
 function parse_args(args)
@@ -127,6 +127,7 @@ function make_plot(temperatures, fulled_cv, edmc_cv, edmc_cv_error; title, outpu
         xlabel="T",
         ylabel="Cv",
         title=title,
+        xscale=:log10,
         xlims=(minimum(temperatures), maximum(temperatures)),
     )
     if edmc_cv !== nothing
