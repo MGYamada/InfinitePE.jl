@@ -8,7 +8,7 @@ function scan_temperatures(input::FullEDHamiltonianInput, temperatures::Abstract
     all(t -> isfinite(t) && t > 0, temperatures) ||
         throw(ArgumentError("all scan temperatures must be positive and finite"))
 
-    result = diagonalize(input; kwargs...)
+    result = spectrum(input; kwargs...)
     observables = FullEDObservables[
         thermal_observables(result, inv(Float64(temperature)), input.bondset.nsites) for temperature in temperatures
     ]

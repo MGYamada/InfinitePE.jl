@@ -16,9 +16,7 @@ end
 
 function internal_energy(result::DiagonalizationResult, beta::Real; atol::Real=1e-10)
     _validate_beta(beta)
-    value = sum(_internal_energy_term(energy, beta) for energy in majorana_energies(result; atol=atol))
-    isfinite(value) || throw(ArgumentError("internal energy is not finite"))
-    return value
+    return _energy_estimators(result, beta; atol=atol).energy
 end
 
 """
@@ -39,9 +37,7 @@ end
 
 function internal_energy_beta_derivative(result::DiagonalizationResult, beta::Real; atol::Real=1e-10)
     _validate_beta(beta)
-    value = sum(_internal_energy_beta_derivative_term(energy, beta) for energy in majorana_energies(result; atol=atol))
-    isfinite(value) || throw(ArgumentError("internal energy beta derivative is not finite"))
-    return value
+    return _energy_estimators(result, beta; atol=atol).energy_beta_derivative
 end
 
 """
@@ -72,8 +68,10 @@ function measure(
 
     for sample in samples
         sample_input = KitaevHamiltonianInput(input.bondset, sample)
-        total_energy = internal_energy(sample_input, beta; couplings=couplings, atol=atol)
-        total_derivative = internal_energy_beta_derivative(sample_input, beta; couplings=couplings, atol=atol)
+        result = diagonalize(build_hamiltonian(sample_input; couplings=couplings))
+        estimators = _energy_estimators(result, beta; atol=atol)
+        total_energy = estimators.energy
+        total_derivative = estimators.energy_beta_derivative
         energy_per_site = total_energy / nsites
         derivative_per_site = total_derivative / nsites
         isfinite(energy_per_site) || throw(ArgumentError("sample energy is not finite"))
@@ -122,6 +120,16 @@ Convert a temperature scan to comparison rows with stable field names.
 """
 function comparison_table(scan::EDMCTemperatureScanResult; method::Symbol=:EDMC, metadata=NamedTuple())
     return [comparison_row(obs; method=method, metadata=metadata) for obs in scan.observables]
+end
+
+function _energy_estimators(result::DiagonalizationResult, beta::Real; atol::Real=1e-10)
+    _validate_beta(beta)
+    energies = majorana_energies(result; atol=atol)
+    energy = sum(_internal_energy_term(energy, beta) for energy in energies)
+    derivative = sum(_internal_energy_beta_derivative_term(energy, beta) for energy in energies)
+    isfinite(energy) || throw(ArgumentError("internal energy is not finite"))
+    isfinite(derivative) || throw(ArgumentError("internal energy beta derivative is not finite"))
+    return (energy=energy, energy_beta_derivative=derivative)
 end
 
 function _internal_energy_term(energy::Real, beta::Real)

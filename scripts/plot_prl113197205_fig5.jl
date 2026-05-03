@@ -42,6 +42,7 @@ Options:
   --pf-measurement-replicas INT        Pure field refreshes per gauge sample [4]
   --large-lattice-threshold INT        Auto observable switches above this N [256]
   --cutoff INT                         Matsubara cutoff for pseudofermion IPE [8]
+  --progress true|false                Print per-temperature progress [true]
   --output PATH                        Figure output path [prl113197205_fig5_fulled.png]
   --csv PATH                           Optional CSV output path for plotted data
   --help                               Show this message
@@ -88,6 +89,18 @@ function get_symbol(opts, key, default, allowed)
     value = Symbol(get(opts, key, string(default)))
     value in allowed || throw(ArgumentError("--$key must be one of $(join(string.(allowed), ", ")); got :$value"))
     return value
+end
+
+function progress_log(enabled::Bool, message)
+    enabled || return nothing
+    println(stderr, message)
+    flush(stderr)
+    return nothing
+end
+
+function progress_temperature(enabled::Bool, phase, index::Integer, total::Integer, temperature::Real, message="")
+    suffix = isempty(message) ? "" : " $message"
+    return progress_log(enabled, "[$phase $index/$total] T=$(round(Float64(temperature); sigdigits=6))$suffix")
 end
 
 function temperatures_from_options(opts)
@@ -343,7 +356,7 @@ function pure_pseudofermion_specific_heat_jackknife(
         push!(block_derivative_sums, block_derivative_sum)
     end
 
-    estimate = _specific_heat_from_sums(sum(energies), sum(abs2, energies), sum(derivatives), length(samples), beta, nsites)
+    estimate = _specific_heat_from_sums(sum(energies), sum(abs2, energies), sum(derivatives), length(energies), beta, nsites)
     length(samples) == 1 && return estimate, 0.0
 
     jackknife_values = Float64[]
@@ -461,6 +474,92 @@ function pseudofermion_scan(
     throw(ArgumentError("unsupported pseudofermion backend :$backend"))
 end
 
+function edmc_runs_with_progress(
+    input,
+    temperatures;
+    warmup_sweeps::Integer,
+    sampling_sweeps::Integer,
+    seed,
+    couplings,
+    progress::Bool,
+)
+    rng = MersenneTwister(seed)
+    current = input
+    runs = EDMC.EDMCDriverResult[]
+    sizehint!(runs, length(temperatures))
+    for (i, temperature) in enumerate(temperatures)
+        progress_temperature(progress, "EDMC", i, length(temperatures), temperature, "start")
+        run = EDMC.run_edmc(
+            current,
+            inv(Float64(temperature));
+            warmup_sweeps=warmup_sweeps,
+            sampling_sweeps=sampling_sweeps,
+            rng=rng,
+            couplings=couplings,
+        )
+        push!(runs, run)
+        current = run.final_input
+        progress_temperature(
+            progress,
+            "EDMC",
+            i,
+            length(temperatures),
+            temperature,
+            "done acceptance=$(round(EDMC.acceptance_rate(run); sigdigits=4))",
+        )
+    end
+    return runs
+end
+
+function sparse_pseudofermion_runs_with_progress(
+    input,
+    temperatures;
+    cutoff::Integer,
+    warmup_sweeps::Integer,
+    sampling_sweeps::Integer,
+    seed,
+    couplings,
+    solver::Symbol,
+    operator::Symbol,
+    tol::Real,
+    maxiter::Integer,
+    krylovdim::Integer,
+    progress::Bool,
+)
+    rng = MersenneTwister(seed)
+    current = input
+    runs = []
+    sizehint!(runs, length(temperatures))
+    for (i, temperature) in enumerate(temperatures)
+        progress_temperature(progress, "PF-MC", i, length(temperatures), temperature, "start")
+        run = run_sparse_pseudofermion_mc(
+            current,
+            inv(Float64(temperature));
+            cutoff=cutoff,
+            warmup_sweeps=warmup_sweeps,
+            sampling_sweeps=sampling_sweeps,
+            rng=rng,
+            couplings=couplings,
+            solver=solver,
+            operator=operator,
+            tol=tol,
+            maxiter=maxiter,
+            krylovdim=krylovdim,
+        )
+        push!(runs, run)
+        current = getproperty(run, :final_input)
+        progress_temperature(
+            progress,
+            "PF-MC",
+            i,
+            length(temperatures),
+            temperature,
+            "done acceptance=$(round(getproperty(run, :acceptance_rate); sigdigits=4))",
+        )
+    end
+    return runs
+end
+
 function _specific_heat_from_sums(energy_sum, energy2_sum, derivative_sum, nsamples, beta, nsites)
     mean_energy = energy_sum / nsamples
     mean_energy2 = energy2_sum / nsamples
@@ -495,13 +594,17 @@ function main(args)
     include_fulled = get_bool(opts, "include-fulled", true)
     include_edmc = get_bool(opts, "include-edmc", true)
     include_pseudofermion = get_bool(opts, "include-pseudofermion", true)
+    progress = get_bool(opts, "progress", true)
 
     lat = generate_honeycomb(L, L, TypeII())
+    progress_log(progress, "Fig.5-like run: L=$L, nsites=$(lat.nsites), temperatures=$(length(temperatures))")
     fulled_cv = nothing
     if include_fulled
+        progress_log(progress, "[FullED] start")
         fulled_input = FullED.lattice_to_fulled(lat)
         fulled_scan = FullED.scan_temperatures(fulled_input, temperatures; couplings=couplings, sign=sign)
         fulled_cv = [obs.specific_heat for obs in fulled_scan.observables]
+        progress_log(progress, "[FullED] done")
     end
 
     edmc_cv = nothing
@@ -511,20 +614,22 @@ function main(args)
     seed = get_int(opts, "seed", 113197205)
     edmc_input = EDMC.lattice_to_edmc(lat)
     if include_edmc
-        edmc_scan = EDMC.scan_temperatures(
+        edmc_runs = edmc_runs_with_progress(
             edmc_input,
             temperatures;
             warmup_sweeps=warmup,
             sampling_sweeps=sampling,
             seed=seed,
             couplings=couplings,
+            progress=progress,
         )
         estimates = [
             edmc_specific_heat_jackknife(edmc_input, inv(Float64(temperature)), run.samples; couplings=couplings)
-            for (temperature, run) in zip(temperatures, edmc_scan.runs)
+            for (temperature, run) in zip(temperatures, edmc_runs)
         ]
         edmc_cv = first.(estimates)
         edmc_cv_error = last.(estimates)
+        progress_log(progress, "[EDMC] jackknife done")
     end
 
     pf_cv = nothing
@@ -546,47 +651,74 @@ function main(args)
         pf_measurement_replicas > 0 || throw(ArgumentError("--pf-measurement-replicas must be positive"))
         large_lattice_threshold = get_int(opts, "large-lattice-threshold", 256)
         large_lattice_threshold > 0 || throw(ArgumentError("--large-lattice-threshold must be positive"))
-        pf_scan = pseudofermion_scan(
-            edmc_input,
-            temperatures;
-            backend=pf_backend,
-            cutoff=cutoff,
-            warmup_sweeps=pf_warmup,
-            sampling_sweeps=pf_sampling,
-            seed=pf_seed,
-            couplings=couplings,
-            solver=pf_solver,
-            operator=pf_operator,
-            tol=pf_tol,
-            maxiter=pf_maxiter,
-            krylovdim=pf_krylovdim,
-            observable=pf_observable,
-            measurement_seed=pf_measurement_seed,
-            large_lattice_threshold=large_lattice_threshold,
-        )
-        estimates = [
-            pseudofermion_specific_heat_estimate(
+        pf_runs = if pf_backend === :sparse
+            sparse_pseudofermion_runs_with_progress(
                 edmc_input,
-                inv(Float64(temperature)),
-                run.samples;
-                observable=pf_observable,
+                temperatures;
                 cutoff=cutoff,
-                seed=pf_measurement_seed + i - 1,
-                measurement_replicas=pf_measurement_replicas,
+                warmup_sweeps=pf_warmup,
+                sampling_sweeps=pf_sampling,
+                seed=pf_seed,
                 couplings=couplings,
                 solver=pf_solver,
                 operator=pf_operator,
                 tol=pf_tol,
                 maxiter=pf_maxiter,
                 krylovdim=pf_krylovdim,
+                progress=progress,
+            )
+        else
+            progress_log(progress, "[PF-MC] dense backend start")
+            pf_scan = pseudofermion_scan(
+                edmc_input,
+                temperatures;
+                backend=pf_backend,
+                cutoff=cutoff,
+                warmup_sweeps=pf_warmup,
+                sampling_sweeps=pf_sampling,
+                seed=pf_seed,
+                couplings=couplings,
+                solver=pf_solver,
+                operator=pf_operator,
+                tol=pf_tol,
+                maxiter=pf_maxiter,
+                krylovdim=pf_krylovdim,
+                observable=pf_observable,
+                measurement_seed=pf_measurement_seed,
                 large_lattice_threshold=large_lattice_threshold,
             )
-            for (i, (temperature, run)) in enumerate(zip(temperatures, pf_scan.runs))
+            progress_log(progress, "[PF-MC] dense backend done")
+            pf_scan.runs
+        end
+        estimates = [
+            begin
+                progress_temperature(progress, "PF-measure", i, length(temperatures), temperature, "start")
+                estimate = pseudofermion_specific_heat_estimate(
+                    edmc_input,
+                    inv(Float64(temperature)),
+                    run.samples;
+                    observable=pf_observable,
+                    cutoff=cutoff,
+                    seed=pf_measurement_seed + i - 1,
+                    measurement_replicas=pf_measurement_replicas,
+                    couplings=couplings,
+                    solver=pf_solver,
+                    operator=pf_operator,
+                    tol=pf_tol,
+                    maxiter=pf_maxiter,
+                    krylovdim=pf_krylovdim,
+                    large_lattice_threshold=large_lattice_threshold,
+                )
+                progress_temperature(progress, "PF-measure", i, length(temperatures), temperature, "done")
+                estimate
+            end
+            for (i, (temperature, run)) in enumerate(zip(temperatures, pf_runs))
         ]
         pf_cv = first.(estimates)
         pf_cv_error = last.(estimates)
     end
 
+    progress_log(progress, "[plot] writing outputs")
     title = "Type-II honeycomb, N=$(lat.nsites), $(coupling_label(couplings)), cutoff=$cutoff"
     make_plot(temperatures, fulled_cv, edmc_cv, edmc_cv_error, pf_cv, pf_cv_error; title=title, output=output)
     csv !== nothing && write_plot_csv(csv, temperatures, fulled_cv, edmc_cv, edmc_cv_error, pf_cv, pf_cv_error)

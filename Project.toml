@@ -1,7 +1,7 @@
 name = "InfinitePE"
 uuid = "8f2382be-06de-4fd5-b9ab-9eaf2f52df35"
-version = "0.1.3"
-authors = ["Codex"]
+version = "0.1.4"
+authors = ["Masahiko G. Yamada"]
 
 [deps]
 KrylovKit = "0b1a1467-8014-51b9-945f-bf0ae24f4b77"
