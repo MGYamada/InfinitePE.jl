@@ -1,0 +1,27 @@
+"""
+    diagonalize(hamiltonian)
+
+Diagonalize a full spin Hamiltonian and return all eigenpairs.
+"""
+function diagonalize(hamiltonian::AbstractMatrix)
+    _validate_hamiltonian_matrix(hamiltonian)
+    eig = if ishermitian(hamiltonian)
+        eigen(Hermitian(Matrix(hamiltonian)))
+    else
+        eigen(Matrix(hamiltonian))
+    end
+    maximum(abs, imag.(eig.values)) <= 1e-10 ||
+        throw(ArgumentError("FullED Hamiltonian eigenvalues must be real within tolerance"))
+    return FullEDDiagonalizationResult(real.(eig.values), eig.vectors)
+end
+
+function diagonalize(input::FullEDHamiltonianInput; kwargs...)
+    return diagonalize(build_hamiltonian(input; kwargs...))
+end
+
+function _validate_hamiltonian_matrix(hamiltonian::AbstractMatrix)
+    size(hamiltonian, 1) == size(hamiltonian, 2) ||
+        throw(ArgumentError("FullED Hamiltonian must be square; got size $(size(hamiltonian))"))
+    all(isfinite, hamiltonian) || throw(ArgumentError("FullED Hamiltonian contains NaN or Inf entries"))
+    return nothing
+end

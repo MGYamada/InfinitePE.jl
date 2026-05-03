@@ -38,6 +38,10 @@ end
 
 Return the non-negative single-particle energies from a particle-hole paired
 Majorana spectrum.
+
+The diagonalized Hermitian Majorana hopping matrix has paired eigenvalues
+`±λ`. Thermodynamic formulas in this module follow the convention
+`H = sum(ε * (f†f - 1/2))`, so the returned excitation energies are `ε = 2λ`.
 """
 function majorana_energies(result::DiagonalizationResult; atol::Real=1e-10)
     atol >= 0 || throw(ArgumentError("atol must be non-negative; got $atol"))
@@ -48,7 +52,7 @@ function majorana_energies(result::DiagonalizationResult; atol::Real=1e-10)
     iseven(nzero) ||
         throw(ArgumentError("Majorana spectrum has an odd number of zero modes ($nzero); cannot form paired energies"))
 
-    energies = vcat(fill(0.0, div(nzero, 2)), positives)
+    energies = vcat(fill(0.0, div(nzero, 2)), 2 .* positives)
     expected = div(length(values), 2)
     length(energies) == expected ||
         throw(ArgumentError(
