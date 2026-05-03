@@ -1,6 +1,8 @@
 module InfinitePE
 
 include("lattices.jl")
+include("infinite_product_expansion.jl")
+include("sparse.jl")
 include("EDMC/EDMC.jl")
 include("FullED/FullED.jl")
 
