@@ -105,14 +105,26 @@ function refresh_sparse_real_pseudofermions(
     cutoff::Integer,
     rng::AbstractRNG=Random.default_rng(),
 )
+    return _refresh_sparse_real_pseudofermions_with_action(matrix, beta; cutoff=cutoff, rng=rng).fields
+end
+
+function _refresh_sparse_real_pseudofermions_with_action(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real;
+    cutoff::Integer,
+    rng::AbstractRNG=Random.default_rng(),
+)
     cutoff > 0 || throw(ArgumentError("cutoff must be positive; got $cutoff"))
     _validate_sparse_majorana_matrix(matrix)
     fields = Vector{Vector{Float64}}(undef, cutoff)
+    action = 0.0
     for n in 0:(cutoff - 1)
         xi = randn(rng, size(matrix, 1))
+        action += 0.5 * dot(xi, xi)
         fields[n + 1] = sparse_matsubara_transpose_mul(matrix, beta, n, xi)
     end
-    return fields
+    isfinite(action) || throw(ArgumentError("pseudofermion reference action is not finite"))
+    return (fields=fields, action=action)
 end
 
 function refresh_sparse_real_pseudofermions(
@@ -769,29 +781,68 @@ function _run_sparse_pseudofermion_sweep(
     krylovdim::Integer,
 )
     current = input
+    current_matrix = build_sparse_majorana_matrix(current; couplings=couplings)
     accepted = 0
     for _ in 1:attempts
-        fields = refresh_sparse_real_pseudofermions(current, beta; cutoff=cutoff, rng=rng, couplings=couplings)
+        refresh = _refresh_sparse_real_pseudofermions_with_action(current_matrix, beta; cutoff=cutoff, rng=rng)
         bond = rand(rng, 1:attempts)
-        proposed = EDMC.flip_gauge(current, bond)
-        delta_action = delta_sparse_pseudofermion_action(
-            current,
-            proposed,
+        _flip_sparse_majorana_matrix!(current_matrix, current, bond; couplings=couplings)
+        delta_action = sparse_pseudofermion_action(
+            current_matrix,
             beta,
-            fields;
-            couplings=couplings,
+            refresh.fields;
             solver=solver,
             operator=operator,
             tol=tol,
             maxiter=maxiter,
             krylovdim=krylovdim,
-        )
+        ) - refresh.action
         if rand(rng) < acceptance_probability_pseudofermion(delta_action)
-            current = proposed
+            current = EDMC.flip_gauge(current, bond)
             accepted += 1
+        else
+            _flip_sparse_majorana_matrix!(current_matrix, current, bond; couplings=couplings)
         end
     end
     return current, accepted
+end
+
+function _flip_sparse_majorana_matrix!(
+    matrix::SparseMatrixCSC{<:Real},
+    input,
+    bond_index::Integer;
+    couplings,
+)
+    bonds = getproperty(getproperty(input, :bondset), :bonds)
+    1 <= bond_index <= length(bonds) ||
+        throw(ArgumentError("bond_index must be in 1:$(length(bonds)); got $bond_index"))
+    bond = bonds[bond_index]
+    src = getproperty(bond, :src)
+    dst = getproperty(bond, :dst)
+    kind = getproperty(bond, :kind)
+    u = getproperty(getproperty(input, :gauge), :u)
+    amplitude = 2.0 * _kitaev_coupling(couplings, kind) * u[bond_index]
+
+    _add_existing_sparse_entry_delta!(matrix, src, dst, -2.0 * amplitude)
+    _add_existing_sparse_entry_delta!(matrix, dst, src, 2.0 * amplitude)
+    return matrix
+end
+
+function _add_existing_sparse_entry_delta!(
+    matrix::SparseMatrixCSC{<:Real},
+    row::Integer,
+    col::Integer,
+    delta::Real,
+)
+    iszero(delta) && return matrix
+    isfinite(delta) || throw(ArgumentError("sparse entry delta must be finite; got $delta"))
+    for ptr in nzrange(matrix, col)
+        if rowvals(matrix)[ptr] == row
+            nonzeros(matrix)[ptr] += delta
+            return matrix
+        end
+    end
+    throw(ArgumentError("cannot update missing sparse entry at ($row, $col)"))
 end
 
 function _sparse_z2_gauge_samples(samples)

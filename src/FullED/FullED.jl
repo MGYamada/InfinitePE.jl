@@ -20,7 +20,7 @@ include("driver.jl")
 
 export FullEDHamiltonianInput, FullEDDiagonalizationResult, FullEDObservables
 export FullEDTemperatureScanResult
-export lattice_to_fulled, build_hamiltonian, diagonalize
+export lattice_to_fulled, build_hamiltonian, diagonalize, spectrum
 export partition_function, free_energy, thermal_observables, scan_temperatures
 export comparison_row, comparison_table
 

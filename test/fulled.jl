@@ -25,7 +25,8 @@
     scan = FullED.scan_temperatures(input, [0.5, 1.0, 2.0])
     @test scan.temperatures == [0.5, 1.0, 2.0]
     @test length(scan.observables) == 3
-    @test scan.diag_result.eigenvalues == result.eigenvalues
+    @test scan.diag_result.eigenvalues ≈ result.eigenvalues
+    @test size(scan.diag_result.eigenvectors, 2) == 0
 
     rows = FullED.comparison_table(scan; metadata=(baseline="PRL113197205",))
     @test length(rows) == 3
