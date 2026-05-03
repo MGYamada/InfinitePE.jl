@@ -215,6 +215,24 @@ pure pseudofermion estimator を実装する場合は、少なくとも次の値
 - `solver`, `operator`, `tol`, `maxiter`, `krylovdim`
 - pseudofermion refresh の粒度、例えば `per_attempt` か `per_sweep`
 
+実装上は次の入口を使います。
+
+- `pure_pseudofermion_estimators(A, beta, fields; solver=:cg, operator=:matrix_free, ...)`
+  は固定した gauge / pseudofermion field の `E_pf` と `dE_pf/d beta` を返す。
+- `measure_pure_pseudofermion_observables(input, beta; samples, cutoff, seed, ...)`
+  は EDMC と同じ gauge sample chain を受け取り、pure estimator で `EDMCObservables`
+  互換の集約結果を返す。
+- `pure_pseudofermion_cutoff_diagnostics(input, beta; samples, cutoffs, seed, ...)`
+  は同じ gauge chain 上の EDMC-compatible 測定を基準に、cutoff ごとの bias /
+  variance / `C_pf` を比較する。
+- `measure_sparse_pseudofermion_mc(...; observable=:pure)` は sparse CG の pure
+  estimator のみで測る。`observable=:auto` では `large_lattice_threshold` より大きい
+  格子を pure estimator に切り替える。
+- `scripts/plot_prl113197205_fig5.jl` の pure estimator プロットでは
+  `--pf-measurement-replicas` で各 gauge sample あたりの pseudofermion field refresh
+  数を増やす。低温側の `C_pf` はノイズで負に振れやすく、反復数が少ないと非負丸めで
+  ゼロに張り付くことがある。
+
 ## 注意点
 
 - finite cutoff の observable は、厳密な EDMC observable ではなく `W_N` に対する observable。cutoff extrapolation が必要。

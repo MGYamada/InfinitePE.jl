@@ -2,6 +2,7 @@
 
 using InfinitePE
 using Plots
+using Random
 
 const USAGE = """
 Create a Plots.jl figure in the style of Supplemental Material Fig. 5 of
@@ -29,12 +30,17 @@ Options:
   --pf-warmup INT                      Pseudofermion warmup sweeps per temperature [warmup]
   --pf-sampling INT                    Pseudofermion sampling sweeps per temperature [sampling]
   --pf-seed INT                        Pseudofermion RNG seed [seed]
-  --pf-backend dense|sparse            Pseudofermion backend [dense]
+  --pf-backend dense|sparse            Pseudofermion backend [sparse]
+  --pf-observable edmc_compatible|pure|auto
+                                        Pseudofermion observable estimator [pure]
   --pf-solver cg|direct                Sparse pseudofermion solver [cg]
   --pf-operator matrix_free|matrix      Sparse CG normal operator [matrix_free]
   --pf-tol FLOAT                       Sparse solver tolerance [1e-10]
   --pf-maxiter INT                     Sparse solver max iterations [1000]
   --pf-krylovdim INT                   Sparse solver Krylov dimension [30]
+  --pf-measurement-seed INT            Pure observable RNG seed [pf-seed]
+  --pf-measurement-replicas INT        Pure field refreshes per gauge sample [4]
+  --large-lattice-threshold INT        Auto observable switches above this N [256]
   --cutoff INT                         Matsubara cutoff for pseudofermion IPE [8]
   --output PATH                        Figure output path [prl113197205_fig5_fulled.png]
   --csv PATH                           Optional CSV output path for plotted data
@@ -245,7 +251,7 @@ function edmc_specific_heat_jackknife(input, beta, samples; couplings=(x=1.0, y=
         push!(derivatives, EDMC.internal_energy_beta_derivative(sample_input, beta; couplings=couplings, atol=atol))
     end
 
-    estimate = _specific_heat_from_sums(sum(energies), sum(abs2, energies), sum(derivatives), length(samples), beta, nsites)
+    estimate = _specific_heat_from_sums(sum(energies), sum(abs2, energies), sum(derivatives), length(energies), beta, nsites)
     length(samples) == 1 && return estimate, 0.0
 
     jackknife_values = Float64[]
@@ -278,6 +284,133 @@ function pseudofermion_specific_heat_jackknife(input, beta, samples; couplings=(
     return edmc_specific_heat_jackknife(input, beta, gauge_samples; couplings=couplings, atol=atol)
 end
 
+function pure_pseudofermion_specific_heat_jackknife(
+    input,
+    beta,
+    samples;
+    cutoff::Integer,
+    seed,
+    measurement_replicas::Integer=4,
+    couplings=(x=1.0, y=1.0, z=1.0),
+    solver::Symbol=:cg,
+    operator::Symbol=:matrix_free,
+    tol::Real=1e-10,
+    maxiter::Integer=1000,
+    krylovdim::Integer=30,
+)
+    isempty(samples) && throw(ArgumentError("cannot compute Jackknife error without pseudofermion samples"))
+    measurement_replicas > 0 || throw(ArgumentError("measurement_replicas must be positive; got $measurement_replicas"))
+    rng = MersenneTwister(seed)
+    gauge_samples = [sample isa EDMC.Z2GaugeField ? sample : EDMC.Z2GaugeField(sample) for sample in samples]
+    nsites = input.bondset.nsites
+    energies = Float64[]
+    derivatives = Float64[]
+    block_energy_sums = Float64[]
+    block_energy2_sums = Float64[]
+    block_derivative_sums = Float64[]
+    sizehint!(energies, measurement_replicas * length(gauge_samples))
+    sizehint!(derivatives, measurement_replicas * length(gauge_samples))
+    sizehint!(block_energy_sums, length(gauge_samples))
+    sizehint!(block_energy2_sums, length(gauge_samples))
+    sizehint!(block_derivative_sums, length(gauge_samples))
+
+    for sample in gauge_samples
+        sample_input = EDMC.KitaevHamiltonianInput(input.bondset, sample)
+        matrix = build_sparse_majorana_matrix(sample_input; couplings=couplings)
+        block_energy_sum = 0.0
+        block_energy2_sum = 0.0
+        block_derivative_sum = 0.0
+        for _ in 1:measurement_replicas
+            fields = refresh_sparse_real_pseudofermions(matrix, beta; cutoff=cutoff, rng=rng)
+            estimator = pure_pseudofermion_estimators(
+                matrix,
+                beta,
+                fields;
+                solver=solver,
+                operator=operator,
+                tol=tol,
+                maxiter=maxiter,
+                krylovdim=krylovdim,
+            )
+            push!(energies, estimator.energy)
+            push!(derivatives, estimator.energy_beta_derivative)
+            block_energy_sum += estimator.energy
+            block_energy2_sum += abs2(estimator.energy)
+            block_derivative_sum += estimator.energy_beta_derivative
+        end
+        push!(block_energy_sums, block_energy_sum)
+        push!(block_energy2_sums, block_energy2_sum)
+        push!(block_derivative_sums, block_derivative_sum)
+    end
+
+    estimate = _specific_heat_from_sums(sum(energies), sum(abs2, energies), sum(derivatives), length(samples), beta, nsites)
+    length(samples) == 1 && return estimate, 0.0
+
+    jackknife_values = Float64[]
+    sizehint!(jackknife_values, length(samples))
+    energy_sum = sum(energies)
+    energy2_sum = sum(abs2, energies)
+    derivative_sum = sum(derivatives)
+    for i in eachindex(samples)
+        push!(
+            jackknife_values,
+            _specific_heat_from_sums(
+                energy_sum - block_energy_sums[i],
+                energy2_sum - block_energy2_sums[i],
+                derivative_sum - block_derivative_sums[i],
+                length(energies) - measurement_replicas,
+                beta,
+                nsites,
+            ),
+        )
+    end
+
+    jackknife_mean = sum(jackknife_values) / length(jackknife_values)
+    variance = (length(jackknife_values) - 1) / length(jackknife_values) *
+               sum(abs2(value - jackknife_mean) for value in jackknife_values)
+    return estimate, sqrt(max(0.0, variance))
+end
+
+function pseudofermion_specific_heat_estimate(
+    input,
+    beta,
+    samples;
+    observable::Symbol,
+    cutoff::Integer,
+    seed,
+    measurement_replicas::Integer,
+    couplings,
+    solver::Symbol,
+    operator::Symbol,
+    tol::Real,
+    maxiter::Integer,
+    krylovdim::Integer,
+    large_lattice_threshold::Integer,
+    atol::Real=1e-10,
+)
+    mode = observable === :auto && input.bondset.nsites > large_lattice_threshold ? :pure :
+           observable === :auto ? :edmc_compatible : observable
+    if mode === :edmc_compatible
+        return pseudofermion_specific_heat_jackknife(input, beta, samples; couplings=couplings, atol=atol)
+    elseif mode === :pure
+        return pure_pseudofermion_specific_heat_jackknife(
+            input,
+            beta,
+            samples;
+            cutoff=cutoff,
+            seed=seed,
+            measurement_replicas=measurement_replicas,
+            couplings=couplings,
+            solver=solver,
+            operator=operator,
+            tol=tol,
+            maxiter=maxiter,
+            krylovdim=krylovdim,
+        )
+    end
+    throw(ArgumentError("unsupported pseudofermion observable :$observable"))
+end
+
 function pseudofermion_scan(
     input,
     temperatures;
@@ -292,6 +425,9 @@ function pseudofermion_scan(
     tol::Real,
     maxiter::Integer,
     krylovdim::Integer,
+    observable::Symbol,
+    measurement_seed,
+    large_lattice_threshold::Integer,
 )
     if backend === :dense
         return scan_pseudofermion_temperatures(
@@ -317,6 +453,9 @@ function pseudofermion_scan(
             tol=tol,
             maxiter=maxiter,
             krylovdim=krylovdim,
+            observable=observable,
+            measurement_seed=measurement_seed,
+            large_lattice_threshold=large_lattice_threshold,
         )
     end
     throw(ArgumentError("unsupported pseudofermion backend :$backend"))
@@ -395,12 +534,18 @@ function main(args)
         pf_warmup = get_int(opts, "pf-warmup", warmup)
         pf_sampling = get_int(opts, "pf-sampling", sampling)
         pf_seed = get_int(opts, "pf-seed", seed)
-        pf_backend = get_symbol(opts, "pf-backend", :dense, (:dense, :sparse))
+        pf_backend = get_symbol(opts, "pf-backend", :sparse, (:dense, :sparse))
+        pf_observable = get_symbol(opts, "pf-observable", :pure, (:edmc_compatible, :pure, :auto))
         pf_solver = get_symbol(opts, "pf-solver", :cg, (:cg, :direct))
         pf_operator = get_symbol(opts, "pf-operator", :matrix_free, (:matrix_free, :matrix))
         pf_tol = get_float(opts, "pf-tol", 1e-10)
         pf_maxiter = get_int(opts, "pf-maxiter", 1000)
         pf_krylovdim = get_int(opts, "pf-krylovdim", 30)
+        pf_measurement_seed = get_int(opts, "pf-measurement-seed", pf_seed)
+        pf_measurement_replicas = get_int(opts, "pf-measurement-replicas", 4)
+        pf_measurement_replicas > 0 || throw(ArgumentError("--pf-measurement-replicas must be positive"))
+        large_lattice_threshold = get_int(opts, "large-lattice-threshold", 256)
+        large_lattice_threshold > 0 || throw(ArgumentError("--large-lattice-threshold must be positive"))
         pf_scan = pseudofermion_scan(
             edmc_input,
             temperatures;
@@ -415,10 +560,28 @@ function main(args)
             tol=pf_tol,
             maxiter=pf_maxiter,
             krylovdim=pf_krylovdim,
+            observable=pf_observable,
+            measurement_seed=pf_measurement_seed,
+            large_lattice_threshold=large_lattice_threshold,
         )
         estimates = [
-            pseudofermion_specific_heat_jackknife(edmc_input, inv(Float64(temperature)), run.samples; couplings=couplings)
-            for (temperature, run) in zip(temperatures, pf_scan.runs)
+            pseudofermion_specific_heat_estimate(
+                edmc_input,
+                inv(Float64(temperature)),
+                run.samples;
+                observable=pf_observable,
+                cutoff=cutoff,
+                seed=pf_measurement_seed + i - 1,
+                measurement_replicas=pf_measurement_replicas,
+                couplings=couplings,
+                solver=pf_solver,
+                operator=pf_operator,
+                tol=pf_tol,
+                maxiter=pf_maxiter,
+                krylovdim=pf_krylovdim,
+                large_lattice_threshold=large_lattice_threshold,
+            )
+            for (i, (temperature, run)) in enumerate(zip(temperatures, pf_scan.runs))
         ]
         pf_cv = first.(estimates)
         pf_cv_error = last.(estimates)
@@ -434,7 +597,11 @@ function main(args)
     println("include_fulled=$include_fulled")
     println("include_edmc=$include_edmc")
     if include_pseudofermion
-        println("include_pseudofermion=$include_pseudofermion, backend=$(get(opts, "pf-backend", "dense")), cutoff=$cutoff")
+        println(
+            "include_pseudofermion=$include_pseudofermion, backend=$(get(opts, "pf-backend", "sparse")), " *
+            "observable=$(get(opts, "pf-observable", "pure")), cutoff=$cutoff, " *
+            "measurement_replicas=$(get(opts, "pf-measurement-replicas", "4"))",
+        )
     else
         println("include_pseudofermion=false")
     end
