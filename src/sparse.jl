@@ -207,6 +207,7 @@ function pure_pseudofermion_estimators(
     tol::Real=1e-10,
     maxiter::Integer=1000,
     krylovdim::Integer=30,
+    factorizations=nothing,
 )
     _validate_beta(beta)
     _validate_sparse_majorana_matrix(matrix)
@@ -228,6 +229,7 @@ function pure_pseudofermion_estimators(
             tol=tol,
             maxiter=maxiter,
             krylovdim=krylovdim,
+            factorizations=factorizations,
         )
         rx = _sparse_matsubara_beta_derivative_mul(matrix, beta, n, x)
         y = _solve_sparse_normal_matsubara_system(
@@ -240,6 +242,7 @@ function pure_pseudofermion_estimators(
             tol=tol,
             maxiter=maxiter,
             krylovdim=krylovdim,
+            factorizations=factorizations,
         )
         tx = _sparse_matsubara_beta_second_derivative_mul(matrix, n, x)
         energy += -0.5 * dot(x, rx)
@@ -1222,7 +1225,13 @@ function _solve_sparse_normal_matsubara_system(
     tol::Real,
     maxiter::Integer,
     krylovdim::Integer,
+    factorizations=nothing,
 )
+    if factorizations !== nothing
+        0 <= n < length(factorizations) ||
+            throw(ArgumentError("factorization index n=$n is outside available cutoff $(length(factorizations))"))
+        return factorizations[n + 1] \ Vector{Float64}(rhs)
+    end
     if solver === :direct
         m = sparse_matsubara_matrix(matrix, beta, n)
         return (transpose(m) * m) \ rhs
@@ -1242,11 +1251,33 @@ function _solve_sparse_normal_matsubara_system(
             zeros(Float64, length(rhs)),
             CG(maxiter=maxiter, tol=Float64(tol), verbosity=0),
         )
-        info.converged > 0 ||
+        if info.converged <= 0 && !_is_acceptable_cg_residual(info.normres, tol)
             throw(ArgumentError("CG did not converge; residual=$(info.normres), iterations=$(info.numiter)"))
+        end
         return x
     end
     throw(ArgumentError("unsupported sparse solver :$solver; expected :cg or :direct"))
+end
+
+function _sparse_normal_matsubara_factorizations(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real,
+    cutoff::Integer,
+)
+    cutoff > 0 || throw(ArgumentError("cutoff must be positive; got $cutoff"))
+    _validate_beta(beta)
+    _validate_sparse_majorana_matrix(matrix)
+    factors = Vector{Any}(undef, cutoff)
+    for n in 0:(cutoff - 1)
+        m = sparse_matsubara_matrix(matrix, beta, n)
+        factors[n + 1] = factorize(transpose(m) * m)
+    end
+    return factors
+end
+
+function _is_acceptable_cg_residual(residual::Real, tol::Real)
+    isfinite(residual) || return false
+    return residual <= 10 * Float64(tol)
 end
 
 function _validate_solver_options(solver::Symbol, operator::Symbol, tol::Real, maxiter::Integer, krylovdim::Integer)

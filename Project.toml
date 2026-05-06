@@ -1,6 +1,6 @@
 name = "InfinitePE"
 uuid = "8f2382be-06de-4fd5-b9ab-9eaf2f52df35"
-version = "0.1.5"
+version = "0.1.6"
 authors = ["Masahiko G. Yamada"]
 
 [deps]
