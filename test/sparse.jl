@@ -74,6 +74,18 @@ using SparseArrays
     @test estimators.solver == :cg
     @test estimators.operator == :matrix_free
 
+    determinant_estimators = determinant_pseudofermion_estimators(sparse_a, beta; cutoff=cutoff)
+    dense_determinant_estimators = determinant_pseudofermion_estimators(dense_a, beta; cutoff=cutoff)
+    @test determinant_estimators.energy ≈ dense_determinant_estimators.energy
+    @test determinant_estimators.energy_beta_derivative ≈ dense_determinant_estimators.energy_beta_derivative
+    log_weight_minus = log_weight(dense_a, beta - delta_beta; cutoff=cutoff)
+    log_weight_center = log_weight(dense_a, beta; cutoff=cutoff)
+    log_weight_plus = log_weight(dense_a, beta + delta_beta; cutoff=cutoff)
+    @test determinant_estimators.energy ≈ -(log_weight_plus - log_weight_minus) / (2 * delta_beta) rtol = 1e-5
+    @test determinant_estimators.energy_beta_derivative ≈
+          -(log_weight_plus - 2 * log_weight_center + log_weight_minus) / delta_beta^2 rtol = 5e-3 atol = 1e-5
+    @test determinant_estimators.cutoff == cutoff
+
     flipped = EDMC.flip_gauge(input, 1)
     dense_after = build_majorana_matrix(flipped)
     sparse_after = build_sparse_majorana_matrix(flipped)
@@ -109,8 +121,36 @@ using SparseArrays
     @test run1.accepted == run1.warmup_accepted + run1.sampling_accepted
     @test 0.0 <= run1.acceptance_rate <= 1.0
     @test run1.cutoff == 2
+    @test run1.field_refresh == :per_attempt
     @test run1.solver == :cg
     @test run1.operator == :matrix_free
+
+    per_sweep_run1 = run_sparse_pseudofermion_mc(
+        input,
+        beta;
+        cutoff=2,
+        warmup_sweeps=1,
+        sampling_sweeps=2,
+        field_refresh=:per_sweep,
+        seed=457,
+        solver=:cg,
+        operator=:matrix_free,
+    )
+    per_sweep_run2 = run_sparse_pseudofermion_mc(
+        input,
+        beta;
+        cutoff=2,
+        warmup_sweeps=1,
+        sampling_sweeps=2,
+        field_refresh=:per_sweep,
+        seed=457,
+        solver=:cg,
+        operator=:matrix_free,
+    )
+    @test per_sweep_run1.samples == per_sweep_run2.samples
+    @test per_sweep_run1.final_input.gauge.u == per_sweep_run2.final_input.gauge.u
+    @test per_sweep_run1.attempted == 3 * length(input.bondset.bonds)
+    @test per_sweep_run1.field_refresh == :per_sweep
 
     pure_run_obs = measure_sparse_pseudofermion_mc(
         input,
@@ -133,6 +173,19 @@ using SparseArrays
     )
     @test pure_run_obs.energy == auto_large_obs.energy
     @test pure_run_obs.specific_heat == auto_large_obs.specific_heat
+
+    determinant_run_obs = measure_sparse_pseudofermion_mc(
+        input,
+        beta,
+        run1;
+        observable=:determinant,
+        solver=:cg,
+        operator=:matrix_free,
+    )
+    @test determinant_run_obs.nsamples == length(run1.samples)
+    @test determinant_run_obs.nsites == input.bondset.nsites
+    @test isfinite(determinant_run_obs.energy)
+    @test isfinite(determinant_run_obs.energy_beta_derivative)
 
     scan = scan_sparse_pseudofermion_temperatures(
         input,
@@ -181,6 +234,16 @@ using SparseArrays
         solver=:cg,
         operator=:matrix_free,
     )
+    pure_obs_replicated = measure_pure_pseudofermion_observables(
+        input,
+        beta;
+        samples=edmc_run.samples,
+        cutoff=2,
+        measurement_replicas=2,
+        seed=987,
+        solver=:cg,
+        operator=:matrix_free,
+    )
     pure_obs2 = measure_pure_pseudofermion_observables(
         input,
         beta;
@@ -193,16 +256,51 @@ using SparseArrays
     @test pure_obs1.energy == pure_obs2.energy
     @test pure_obs1.specific_heat == pure_obs2.specific_heat
     @test pure_obs1.nsamples == edmc_obs.nsamples
+    @test pure_obs_replicated.nsamples == 2 * edmc_obs.nsamples
     @test pure_obs1.nsites == edmc_obs.nsites
+    @test pure_obs_replicated.nsites == edmc_obs.nsites
     @test isfinite(pure_obs1.energy)
     @test isfinite(pure_obs1.energy_beta_derivative)
+    @test isfinite(pure_obs_replicated.energy)
+    @test isfinite(pure_obs_replicated.energy_beta_derivative)
     @test pure_obs1.specific_heat >= 0
+
+    block_diagnostics1 = pure_pseudofermion_block_diagnostics(
+        input,
+        beta;
+        samples=edmc_run.samples,
+        cutoff=2,
+        measurement_replicas=3,
+        seed=222,
+        solver=:cg,
+        operator=:matrix_free,
+    )
+    block_diagnostics2 = pure_pseudofermion_block_diagnostics(
+        input,
+        beta;
+        samples=edmc_run.samples,
+        cutoff=2,
+        measurement_replicas=3,
+        seed=222,
+        solver=:cg,
+        operator=:matrix_free,
+    )
+    @test block_diagnostics1 == block_diagnostics2
+    @test length(block_diagnostics1) == edmc_obs.nsamples
+    @test getproperty.(block_diagnostics1, :gauge_index) == collect(1:edmc_obs.nsamples)
+    @test getproperty.(block_diagnostics1, :measurement_replicas) == fill(3, edmc_obs.nsamples)
+    @test all(row -> isfinite(row.mean_energy_per_site), block_diagnostics1)
+    @test all(row -> isfinite(row.mean_energy_beta_derivative_per_site), block_diagnostics1)
+    @test all(row -> row.field_variance_per_site >= -1e-12, block_diagnostics1)
+    @test all(row -> row.raw_field_specific_heat_per_site ≈ beta^2 * row.field_variance_minus_derivative_per_site, block_diagnostics1)
+    @test all(row -> row.field_specific_heat_per_site == max(0.0, row.raw_field_specific_heat_per_site), block_diagnostics1)
 
     diagnostics1 = pure_pseudofermion_cutoff_diagnostics(
         input,
         beta;
         samples=edmc_run.samples,
         cutoffs=[1, 2],
+        measurement_replicas=2,
         seed=111,
         solver=:cg,
         operator=:matrix_free,
@@ -212,14 +310,20 @@ using SparseArrays
         beta;
         samples=edmc_run.samples,
         cutoffs=[1, 2],
+        measurement_replicas=2,
         seed=111,
         solver=:cg,
         operator=:matrix_free,
     )
     @test diagnostics1 == diagnostics2
     @test getproperty.(diagnostics1, :cutoff) == [1, 2]
+    @test getproperty.(diagnostics1, :measurement_replicas) == [2, 2]
+    @test getproperty.(diagnostics1, :ngauge_samples) == [edmc_obs.nsamples, edmc_obs.nsamples]
     @test all(row -> row.reference_energy_per_site == edmc_obs.energy, diagnostics1)
     @test all(row -> isfinite(row.energy_bias_per_site) && isfinite(row.specific_heat_bias_per_site), diagnostics1)
+    @test all(row -> isfinite(row.variance_minus_derivative_per_site), diagnostics1)
+    @test all(row -> row.raw_specific_heat_per_site ≈ beta^2 * row.variance_minus_derivative_per_site, diagnostics1)
+    @test all(row -> row.specific_heat_per_site == max(0.0, row.raw_specific_heat_per_site), diagnostics1)
     @test all(row -> row.energy_variance_per_site >= -1e-12, diagnostics1)
 
     @test_throws ArgumentError refresh_sparse_real_pseudofermions(sparse_a, beta; cutoff=0)
@@ -229,8 +333,11 @@ using SparseArrays
     @test_throws ArgumentError sparse_pseudofermion_action(sparse_a, beta, sparse_fields; operator=:unknown)
     @test_throws ArgumentError run_sparse_pseudofermion_mc(input, beta; cutoff=0, sampling_sweeps=1)
     @test_throws ArgumentError run_sparse_pseudofermion_mc(input, beta; cutoff=1, sampling_sweeps=1, seed=1, rng=MersenneTwister(1))
+    @test_throws ArgumentError run_sparse_pseudofermion_mc(input, beta; cutoff=1, sampling_sweeps=1, field_refresh=:never)
     @test_throws ArgumentError measure_sparse_pseudofermion_mc(input, beta, run1; observable=:unknown)
     @test_throws ArgumentError scan_sparse_pseudofermion_temperatures(input, Float64[]; cutoff=1, sampling_sweeps=1)
     @test_throws ArgumentError measure_pure_pseudofermion_observables(input, beta; samples=EDMC.Z2GaugeField[], cutoff=1)
+    @test_throws ArgumentError measure_pure_pseudofermion_observables(input, beta; samples=edmc_run.samples, cutoff=1, measurement_replicas=0)
+    @test_throws ArgumentError pure_pseudofermion_block_diagnostics(input, beta; samples=edmc_run.samples, cutoff=1, measurement_replicas=0)
     @test_throws ArgumentError pure_pseudofermion_cutoff_diagnostics(input, beta; samples=edmc_run.samples, cutoffs=Int[])
 end

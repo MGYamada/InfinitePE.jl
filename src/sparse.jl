@@ -11,6 +11,8 @@ export run_sparse_pseudofermion_mc
 export measure_sparse_pseudofermion_mc, scan_sparse_pseudofermion_temperatures
 export sparse_pseudofermion_comparison_row, sparse_pseudofermion_comparison_table
 export pure_pseudofermion_estimators, measure_pure_pseudofermion_observables
+export determinant_pseudofermion_estimators, measure_determinant_pseudofermion_observables
+export pure_pseudofermion_block_diagnostics
 export pure_pseudofermion_cutoff_diagnostics
 
 """
@@ -283,7 +285,101 @@ function pure_pseudofermion_estimators(
 end
 
 """
-    measure_pure_pseudofermion_observables(input, beta; samples, cutoff, seed=nothing, rng=nothing, ...)
+    determinant_pseudofermion_estimators(A, beta; cutoff)
+
+Evaluate finite-cutoff observables after analytically integrating the
+pseudofermion fields. The returned `energy` is `-d log W_N / dβ` and
+`energy_beta_derivative` is its β derivative for fixed gauge.
+"""
+function determinant_pseudofermion_estimators(
+    matrix::AbstractMatrix{<:Real},
+    beta::Real;
+    cutoff::Integer,
+    atol::Real=1e-10,
+)
+    _validate_beta(beta)
+    cutoff > 0 || throw(ArgumentError("cutoff must be positive; got $cutoff"))
+    majorana = Matrix{Float64}(matrix)
+    _validate_majorana_matrix(majorana; atol=atol)
+
+    energy = 0.0
+    derivative = 0.0
+    for n in 0:(cutoff - 1)
+        c = (2 * n + 1) * pi
+        matsubara = Matrix{Float64}(I, size(majorana, 1), size(majorana, 2)) - beta .* majorana ./ c
+        beta_derivative = -majorana ./ c
+        x = matsubara \ beta_derivative
+        energy -= tr(x)
+        derivative += tr(x * x)
+    end
+
+    isfinite(energy) || throw(ArgumentError("determinant pseudofermion energy estimator is not finite"))
+    isfinite(derivative) || throw(ArgumentError("determinant pseudofermion derivative estimator is not finite"))
+    return (
+        energy=energy,
+        energy2=energy^2,
+        energy_beta_derivative=derivative,
+        cutoff=Int(cutoff),
+    )
+end
+
+function determinant_pseudofermion_estimators(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real;
+    cutoff::Integer,
+    atol::Real=1e-10,
+)
+    _validate_beta(beta)
+    cutoff > 0 || throw(ArgumentError("cutoff must be positive; got $cutoff"))
+    _validate_sparse_majorana_matrix(matrix)
+    maximum(abs, matrix + transpose(matrix)) <= atol ||
+        throw(ArgumentError("Majorana matrix must be real antisymmetric within tolerance"))
+
+    energy = 0.0
+    derivative = 0.0
+    nsites = size(matrix, 1)
+    for n in 0:(cutoff - 1)
+        c = (2 * n + 1) * pi
+        matsubara = sparse(I, nsites, nsites) - beta .* matrix ./ c
+        beta_derivative = -matrix ./ c
+        factor = lu(matsubara)
+        for col in 1:nsites
+            rhs = _sparse_column_vector(beta_derivative, col)
+            iszero(norm(rhs)) && continue
+            x = factor \ rhs
+            energy -= x[col]
+            y = factor \ (beta_derivative * x)
+            derivative += y[col]
+        end
+    end
+
+    isfinite(energy) || throw(ArgumentError("determinant pseudofermion energy estimator is not finite"))
+    isfinite(derivative) || throw(ArgumentError("determinant pseudofermion derivative estimator is not finite"))
+    return (
+        energy=energy,
+        energy2=energy^2,
+        energy_beta_derivative=derivative,
+        cutoff=Int(cutoff),
+    )
+end
+
+function determinant_pseudofermion_estimators(
+    input,
+    beta::Real;
+    cutoff::Integer,
+    couplings=(x=1.0, y=1.0, z=1.0),
+    atol::Real=1e-10,
+)
+    return determinant_pseudofermion_estimators(
+        build_sparse_majorana_matrix(input; couplings=couplings),
+        beta;
+        cutoff=cutoff,
+        atol=atol,
+    )
+end
+
+"""
+    measure_pure_pseudofermion_observables(input, beta; samples, cutoff, measurement_replicas=1, seed=nothing, rng=nothing, ...)
 
 Measure `E_pf` and `C_pf` with the pure pseudofermion estimator on an existing
 gauge sample chain. This intentionally accepts the same sample chain as
@@ -295,6 +391,7 @@ function measure_pure_pseudofermion_observables(
     beta::Real;
     samples,
     cutoff::Integer,
+    measurement_replicas::Integer=1,
     seed=nothing,
     rng=nothing,
     couplings=(x=1.0, y=1.0, z=1.0),
@@ -306,9 +403,71 @@ function measure_pure_pseudofermion_observables(
 )
     _validate_beta(beta)
     cutoff > 0 || throw(ArgumentError("cutoff must be positive; got $cutoff"))
+    measurement_replicas > 0 ||
+        throw(ArgumentError("measurement_replicas must be positive; got $measurement_replicas"))
     _validate_solver_options(solver, operator, tol, maxiter, krylovdim)
     gauge_samples = _sparse_z2_gauge_samples(samples)
     local_rng = _sparse_pf_rng(seed, rng)
+
+    nsites = getproperty(getproperty(input, :bondset), :nsites)
+    energies = Float64[]
+    derivatives = Float64[]
+    sizehint!(energies, length(gauge_samples) * measurement_replicas)
+    sizehint!(derivatives, length(gauge_samples) * measurement_replicas)
+
+    for gauge in gauge_samples
+        sample_input = EDMC.KitaevHamiltonianInput(getproperty(input, :bondset), gauge)
+        matrix = build_sparse_majorana_matrix(sample_input; couplings=couplings)
+        for _ in 1:measurement_replicas
+            fields = refresh_sparse_real_pseudofermions(matrix, beta; cutoff=cutoff, rng=local_rng)
+            estimators = pure_pseudofermion_estimators(
+                matrix,
+                beta,
+                fields;
+                solver=solver,
+                operator=operator,
+                tol=tol,
+                maxiter=maxiter,
+                krylovdim=krylovdim,
+            )
+            push!(energies, estimators.energy / nsites)
+            push!(derivatives, estimators.energy_beta_derivative / nsites)
+        end
+    end
+
+    energy = sum(energies) / length(energies)
+    energy2 = sum(abs2, energies) / length(energies)
+    energy_beta_derivative = sum(derivatives) / length(derivatives)
+    specific_heat = beta^2 * (nsites * (energy2 - energy^2) - energy_beta_derivative)
+    return EDMC.EDMCObservables(
+        beta,
+        inv(beta),
+        energy,
+        energy2,
+        energy_beta_derivative,
+        max(0.0, specific_heat),
+        length(energies),
+        nsites,
+    )
+end
+
+"""
+    measure_determinant_pseudofermion_observables(input, beta; samples, cutoff, ...)
+
+Measure finite-cutoff determinant observables on an existing gauge sample
+chain, with pseudofermion fields integrated out analytically.
+"""
+function measure_determinant_pseudofermion_observables(
+    input,
+    beta::Real;
+    samples,
+    cutoff::Integer,
+    couplings=(x=1.0, y=1.0, z=1.0),
+    atol::Real=1e-10,
+)
+    _validate_beta(beta)
+    cutoff > 0 || throw(ArgumentError("cutoff must be positive; got $cutoff"))
+    gauge_samples = _sparse_z2_gauge_samples(samples)
 
     nsites = getproperty(getproperty(input, :bondset), :nsites)
     energies = Float64[]
@@ -318,17 +477,12 @@ function measure_pure_pseudofermion_observables(
 
     for gauge in gauge_samples
         sample_input = EDMC.KitaevHamiltonianInput(getproperty(input, :bondset), gauge)
-        matrix = build_sparse_majorana_matrix(sample_input; couplings=couplings)
-        fields = refresh_sparse_real_pseudofermions(matrix, beta; cutoff=cutoff, rng=local_rng)
-        estimators = pure_pseudofermion_estimators(
-            matrix,
-            beta,
-            fields;
-            solver=solver,
-            operator=operator,
-            tol=tol,
-            maxiter=maxiter,
-            krylovdim=krylovdim,
+        estimators = determinant_pseudofermion_estimators(
+            sample_input,
+            beta;
+            cutoff=cutoff,
+            couplings=couplings,
+            atol=atol,
         )
         push!(energies, estimators.energy / nsites)
         push!(derivatives, estimators.energy_beta_derivative / nsites)
@@ -351,6 +505,93 @@ function measure_pure_pseudofermion_observables(
 end
 
 """
+    pure_pseudofermion_block_diagnostics(input, beta; samples, cutoff, measurement_replicas, ...)
+
+Return per-gauge diagnostics for the conditional pseudofermion estimator.
+For each gauge sample, this estimates `<S_β>_φ`, `Var_φ(S_β | u)`,
+`<S_ββ>_φ`, and the field contribution
+`β² * (Var_φ(S_β | u) - <S_ββ>_φ) / N`.
+"""
+function pure_pseudofermion_block_diagnostics(
+    input,
+    beta::Real;
+    samples,
+    cutoff::Integer,
+    measurement_replicas::Integer,
+    seed=nothing,
+    rng=nothing,
+    couplings=(x=1.0, y=1.0, z=1.0),
+    solver::Symbol=:cg,
+    operator::Symbol=:matrix_free,
+    tol::Real=1e-10,
+    maxiter::Integer=1000,
+    krylovdim::Integer=30,
+)
+    _validate_beta(beta)
+    cutoff > 0 || throw(ArgumentError("cutoff must be positive; got $cutoff"))
+    measurement_replicas > 0 ||
+        throw(ArgumentError("measurement_replicas must be positive; got $measurement_replicas"))
+    _validate_solver_options(solver, operator, tol, maxiter, krylovdim)
+    gauge_samples = _sparse_z2_gauge_samples(samples)
+    local_rng = _sparse_pf_rng(seed, rng)
+    nsites = getproperty(getproperty(input, :bondset), :nsites)
+
+    rows = []
+    sizehint!(rows, length(gauge_samples))
+    for (index, gauge) in enumerate(gauge_samples)
+        sample_input = EDMC.KitaevHamiltonianInput(getproperty(input, :bondset), gauge)
+        matrix = build_sparse_majorana_matrix(sample_input; couplings=couplings)
+        energies = Float64[]
+        derivatives = Float64[]
+        sizehint!(energies, measurement_replicas)
+        sizehint!(derivatives, measurement_replicas)
+
+        for _ in 1:measurement_replicas
+            fields = refresh_sparse_real_pseudofermions(matrix, beta; cutoff=cutoff, rng=local_rng)
+            estimators = pure_pseudofermion_estimators(
+                matrix,
+                beta,
+                fields;
+                solver=solver,
+                operator=operator,
+                tol=tol,
+                maxiter=maxiter,
+                krylovdim=krylovdim,
+            )
+            push!(energies, estimators.energy)
+            push!(derivatives, estimators.energy_beta_derivative)
+        end
+
+        mean_energy = sum(energies) / measurement_replicas
+        mean_energy2 = sum(abs2, energies) / measurement_replicas
+        field_variance = mean_energy2 - mean_energy^2
+        mean_derivative = sum(derivatives) / measurement_replicas
+        field_variance_minus_derivative = field_variance - mean_derivative
+        raw_field_specific_heat = beta^2 * field_variance_minus_derivative / nsites
+
+        push!(rows, (
+            gauge_index=Int(index),
+            cutoff=Int(cutoff),
+            measurement_replicas=Int(measurement_replicas),
+            mean_energy_per_site=mean_energy / nsites,
+            mean_energy2_per_site2=mean_energy2 / nsites^2,
+            field_variance_per_site=field_variance / nsites,
+            mean_energy_beta_derivative_per_site=mean_derivative / nsites,
+            field_variance_minus_derivative_per_site=field_variance_minus_derivative / nsites,
+            raw_field_specific_heat_per_site=raw_field_specific_heat,
+            field_specific_heat_per_site=max(0.0, raw_field_specific_heat),
+            nsites=nsites,
+            solver=solver,
+            operator=operator,
+            tol=Float64(tol),
+            maxiter=Int(maxiter),
+            krylovdim=Int(krylovdim),
+        ))
+    end
+    return rows
+end
+
+"""
     pure_pseudofermion_cutoff_diagnostics(input, beta; samples, cutoffs, ...)
 
 Return rows summarizing `E_pf`/`C_pf` cutoff dependence against the
@@ -361,6 +602,7 @@ function pure_pseudofermion_cutoff_diagnostics(
     beta::Real;
     samples,
     cutoffs::AbstractVector{<:Integer},
+    measurement_replicas::Integer=1,
     seed=nothing,
     rng=nothing,
     couplings=(x=1.0, y=1.0, z=1.0),
@@ -373,6 +615,8 @@ function pure_pseudofermion_cutoff_diagnostics(
 )
     isempty(cutoffs) && throw(ArgumentError("cutoff diagnostics require at least one cutoff"))
     all(cutoff -> cutoff > 0, cutoffs) || throw(ArgumentError("all cutoffs must be positive"))
+    measurement_replicas > 0 ||
+        throw(ArgumentError("measurement_replicas must be positive; got $measurement_replicas"))
     gauge_samples = _sparse_z2_gauge_samples(samples)
     reference = EDMC.measure(input, beta; samples=gauge_samples, couplings=couplings, atol=atol)
     local_rng = _sparse_pf_rng(seed, rng)
@@ -384,6 +628,7 @@ function pure_pseudofermion_cutoff_diagnostics(
             beta;
             samples=gauge_samples,
             cutoff=cutoff,
+            measurement_replicas=measurement_replicas,
             rng=local_rng,
             couplings=couplings,
             solver=solver,
@@ -392,17 +637,23 @@ function pure_pseudofermion_cutoff_diagnostics(
             maxiter=maxiter,
             krylovdim=krylovdim,
         )
+        variance_minus_derivative = obs.nsites * (obs.energy2 - obs.energy^2) - obs.energy_beta_derivative
+        raw_specific_heat = beta^2 * variance_minus_derivative
         push!(rows, (
             cutoff=Int(cutoff),
             energy_per_site=obs.energy,
             energy_bias_per_site=obs.energy - reference.energy,
             energy_variance_per_site=obs.nsites * (obs.energy2 - obs.energy^2),
             energy_beta_derivative_per_site=obs.energy_beta_derivative,
+            variance_minus_derivative_per_site=variance_minus_derivative,
+            raw_specific_heat_per_site=raw_specific_heat,
             specific_heat_per_site=obs.specific_heat,
             specific_heat_bias_per_site=obs.specific_heat - reference.specific_heat,
             reference_energy_per_site=reference.energy,
             reference_specific_heat_per_site=reference.specific_heat,
             nsamples=obs.nsamples,
+            ngauge_samples=length(gauge_samples),
+            measurement_replicas=Int(measurement_replicas),
             nsites=obs.nsites,
             solver=solver,
             operator=operator,
@@ -486,12 +737,13 @@ function delta_sparse_pseudofermion_action(
 end
 
 """
-    run_sparse_pseudofermion_mc(input, beta; cutoff, warmup_sweeps=0, sampling_sweeps, seed=nothing, rng=nothing, couplings=(x=1.0, y=1.0, z=1.0), solver=:cg, operator=:matrix_free)
+    run_sparse_pseudofermion_mc(input, beta; cutoff, warmup_sweeps=0, sampling_sweeps, field_refresh=:per_attempt, seed=nothing, rng=nothing, couplings=(x=1.0, y=1.0, z=1.0), solver=:cg, operator=:matrix_free)
 
 Run a sparse real-pseudofermion Z2 bond-flip Monte Carlo simulation. One sweep
-performs one attempted flip per bond. Each attempt refreshes pseudofermions
-from the current gauge configuration, proposes one random bond flip, and
-accepts with `min(1, exp(-ΔS_pf))`.
+performs one attempted flip per bond. With `field_refresh=:per_attempt`, each
+attempt refreshes pseudofermions from the current gauge configuration. With
+`field_refresh=:per_sweep`, one pseudofermion field is held fixed across the
+sweep and the current action is updated after accepted flips.
 """
 function run_sparse_pseudofermion_mc(
     input,
@@ -499,6 +751,7 @@ function run_sparse_pseudofermion_mc(
     cutoff::Integer,
     warmup_sweeps::Integer=0,
     sampling_sweeps::Integer,
+    field_refresh::Symbol=:per_attempt,
     seed=nothing,
     rng=nothing,
     couplings=(x=1.0, y=1.0, z=1.0),
@@ -512,6 +765,7 @@ function run_sparse_pseudofermion_mc(
     cutoff > 0 || throw(ArgumentError("cutoff must be positive; got $cutoff"))
     warmup_sweeps >= 0 || throw(ArgumentError("warmup_sweeps must be non-negative; got $warmup_sweeps"))
     sampling_sweeps >= 0 || throw(ArgumentError("sampling_sweeps must be non-negative; got $sampling_sweeps"))
+    _validate_field_refresh(field_refresh)
     _validate_solver_options(solver, operator, tol, maxiter, krylovdim)
     local_rng = _sparse_pf_rng(seed, rng)
 
@@ -530,6 +784,7 @@ function run_sparse_pseudofermion_mc(
             beta,
             cutoff,
             nbonds;
+            field_refresh=field_refresh,
             couplings=couplings,
             solver=solver,
             operator=operator,
@@ -547,6 +802,7 @@ function run_sparse_pseudofermion_mc(
             beta,
             cutoff,
             nbonds;
+            field_refresh=field_refresh,
             couplings=couplings,
             solver=solver,
             operator=operator,
@@ -574,6 +830,7 @@ function run_sparse_pseudofermion_mc(
         acceptance_rate=attempted == 0 ? 0.0 : accepted / attempted,
         sampling_acceptance_rate=sampling_attempted == 0 ? 0.0 : sampling_accepted / sampling_attempted,
         cutoff=Int(cutoff),
+        field_refresh=field_refresh,
         solver=solver,
         operator=operator,
         tol=Float64(tol),
@@ -588,7 +845,9 @@ end
 Measure EDMC-compatible observables on gauge samples generated by
 [`run_sparse_pseudofermion_mc`](@ref). The update uses sparse pseudofermions,
 while the default observable convention is intentionally shared with EDMC.
-Use `observable=:pure` to measure `E_pf`/`C_pf` with sparse CG, or
+Use `observable=:pure` to measure `E_pf`/`C_pf` with sparse CG,
+`observable=:determinant` to integrate pseudofermions analytically at finite
+cutoff, or
 `observable=:auto` to switch to the pure estimator when
 `nsites > large_lattice_threshold`.
 """
@@ -598,6 +857,7 @@ function measure_sparse_pseudofermion_mc(
     run;
     observable::Symbol=:edmc_compatible,
     cutoff=nothing,
+    measurement_replicas::Integer=1,
     seed=nothing,
     rng=nothing,
     couplings=(x=1.0, y=1.0, z=1.0),
@@ -626,6 +886,7 @@ function measure_sparse_pseudofermion_mc(
             beta;
             samples=samples,
             cutoff=resolved_cutoff,
+            measurement_replicas=measurement_replicas,
             seed=seed,
             rng=rng,
             couplings=couplings,
@@ -635,12 +896,22 @@ function measure_sparse_pseudofermion_mc(
             maxiter=maxiter,
             krylovdim=krylovdim,
         )
+    elseif mode === :determinant
+        resolved_cutoff = _resolve_sparse_run_option(run, cutoff, :cutoff)
+        return measure_determinant_pseudofermion_observables(
+            input,
+            beta;
+            samples=samples,
+            cutoff=resolved_cutoff,
+            couplings=couplings,
+            atol=atol,
+        )
     end
-    throw(ArgumentError("unsupported observable :$observable; expected :edmc_compatible, :pure, or :auto"))
+    throw(ArgumentError("unsupported observable :$observable; expected :edmc_compatible, :pure, :determinant, or :auto"))
 end
 
 """
-    scan_sparse_pseudofermion_temperatures(input, temperatures; cutoff, warmup_sweeps=0, sampling_sweeps, seed=nothing, rng=nothing, couplings=(x=1.0, y=1.0, z=1.0), solver=:cg, operator=:matrix_free)
+    scan_sparse_pseudofermion_temperatures(input, temperatures; cutoff, warmup_sweeps=0, sampling_sweeps, field_refresh=:per_attempt, seed=nothing, rng=nothing, couplings=(x=1.0, y=1.0, z=1.0), solver=:cg, operator=:matrix_free)
 
 Run sparse real-pseudofermion Infinite Product Expansion sequentially over
 temperatures. Each temperature starts from the previous final gauge
@@ -652,6 +923,7 @@ function scan_sparse_pseudofermion_temperatures(
     cutoff::Integer,
     warmup_sweeps::Integer=0,
     sampling_sweeps::Integer,
+    field_refresh::Symbol=:per_attempt,
     seed=nothing,
     rng=nothing,
     couplings=(x=1.0, y=1.0, z=1.0),
@@ -661,6 +933,7 @@ function scan_sparse_pseudofermion_temperatures(
     maxiter::Integer=1000,
     krylovdim::Integer=30,
     observable::Symbol=:edmc_compatible,
+    measurement_replicas::Integer=1,
     measurement_seed=nothing,
     measurement_rng=nothing,
     large_lattice_threshold::Integer=256,
@@ -670,6 +943,9 @@ function scan_sparse_pseudofermion_temperatures(
     all(t -> isfinite(t) && t > 0, temperatures) ||
         throw(ArgumentError("all scan temperatures must be positive and finite"))
     cutoff > 0 || throw(ArgumentError("cutoff must be positive; got $cutoff"))
+    _validate_field_refresh(field_refresh)
+    measurement_replicas > 0 ||
+        throw(ArgumentError("measurement_replicas must be positive; got $measurement_replicas"))
     _validate_solver_options(solver, operator, tol, maxiter, krylovdim)
     local_rng = _sparse_pf_rng(seed, rng)
 
@@ -685,6 +961,7 @@ function scan_sparse_pseudofermion_temperatures(
             cutoff=cutoff,
             warmup_sweeps=warmup_sweeps,
             sampling_sweeps=sampling_sweeps,
+            field_refresh=field_refresh,
             rng=local_rng,
             couplings=couplings,
             solver=solver,
@@ -699,6 +976,7 @@ function scan_sparse_pseudofermion_temperatures(
             run;
             observable=observable,
             cutoff=cutoff,
+            measurement_replicas=measurement_replicas,
             seed=measurement_seed,
             rng=measurement_rng,
             couplings=couplings,
@@ -721,6 +999,8 @@ function scan_sparse_pseudofermion_temperatures(
         observables=observables,
         runs=runs,
         cutoff=cutoff,
+        field_refresh=field_refresh,
+        measurement_replicas=Int(measurement_replicas),
         solver=solver,
         operator=operator,
         tol=Float64(tol),
@@ -773,6 +1053,7 @@ function _run_sparse_pseudofermion_sweep(
     beta::Real,
     cutoff::Integer,
     attempts::Integer;
+    field_refresh::Symbol,
     couplings,
     solver::Symbol,
     operator::Symbol,
@@ -783,11 +1064,18 @@ function _run_sparse_pseudofermion_sweep(
     current = input
     current_matrix = build_sparse_majorana_matrix(current; couplings=couplings)
     accepted = 0
-    for _ in 1:attempts
+    if field_refresh === :per_sweep
         refresh = _refresh_sparse_real_pseudofermions_with_action(current_matrix, beta; cutoff=cutoff, rng=rng)
+        current_action = refresh.action
+    end
+    for _ in 1:attempts
+        if field_refresh === :per_attempt
+            refresh = _refresh_sparse_real_pseudofermions_with_action(current_matrix, beta; cutoff=cutoff, rng=rng)
+            current_action = refresh.action
+        end
         bond = rand(rng, 1:attempts)
         _flip_sparse_majorana_matrix!(current_matrix, current, bond; couplings=couplings)
-        delta_action = sparse_pseudofermion_action(
+        proposed_action = sparse_pseudofermion_action(
             current_matrix,
             beta,
             refresh.fields;
@@ -796,9 +1084,11 @@ function _run_sparse_pseudofermion_sweep(
             tol=tol,
             maxiter=maxiter,
             krylovdim=krylovdim,
-        ) - refresh.action
+        )
+        delta_action = proposed_action - current_action
         if rand(rng) < acceptance_probability_pseudofermion(delta_action)
             current = EDMC.flip_gauge(current, bond)
+            current_action = proposed_action
             accepted += 1
         else
             _flip_sparse_majorana_matrix!(current_matrix, current, bond; couplings=couplings)
@@ -845,6 +1135,16 @@ function _add_existing_sparse_entry_delta!(
     throw(ArgumentError("cannot update missing sparse entry at ($row, $col)"))
 end
 
+function _sparse_column_vector(matrix::SparseMatrixCSC{<:Real}, col::Integer)
+    1 <= col <= size(matrix, 2) ||
+        throw(ArgumentError("column index must be in 1:$(size(matrix, 2)); got $col"))
+    vector = zeros(Float64, size(matrix, 1))
+    for ptr in nzrange(matrix, col)
+        vector[rowvals(matrix)[ptr]] = nonzeros(matrix)[ptr]
+    end
+    return vector
+end
+
 function _sparse_z2_gauge_samples(samples)
     isempty(samples) && throw(ArgumentError("cannot measure sparse pseudofermion observables without samples"))
     return [_as_sparse_z2_gauge_sample(sample) for sample in samples]
@@ -858,6 +1158,12 @@ function _as_sparse_z2_gauge_sample(sample)
         return EDMC.Z2GaugeField(getproperty(sample, :u))
     end
     return EDMC.Z2GaugeField(sample)
+end
+
+function _validate_field_refresh(field_refresh::Symbol)
+    field_refresh === :per_attempt && return nothing
+    field_refresh === :per_sweep && return nothing
+    throw(ArgumentError("unsupported field_refresh :$field_refresh; expected :per_attempt or :per_sweep"))
 end
 
 function _resolve_sparse_run_option(run, value, name::Symbol)
