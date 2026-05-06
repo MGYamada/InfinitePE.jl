@@ -330,6 +330,9 @@ function pure_pseudofermion_specific_heat_jackknife(
     for sample in gauge_samples
         sample_input = EDMC.KitaevHamiltonianInput(input.bondset, sample)
         matrix = build_sparse_majorana_matrix(sample_input; couplings=couplings)
+        factorizations = solver === :direct ?
+            InfinitePE._sparse_normal_matsubara_factorizations(matrix, beta, cutoff) :
+            nothing
         block_energy_sum = 0.0
         block_energy2_sum = 0.0
         block_derivative_sum = 0.0
@@ -344,6 +347,7 @@ function pure_pseudofermion_specific_heat_jackknife(
                 tol=tol,
                 maxiter=maxiter,
                 krylovdim=krylovdim,
+                factorizations=factorizations,
             )
             push!(energies, estimator.energy)
             push!(derivatives, estimator.energy_beta_derivative)

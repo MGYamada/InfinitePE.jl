@@ -93,6 +93,23 @@ end
     @test acceptance_probability_pseudofermion(-0.3) == 1.0
     @test acceptance_probability_pseudofermion(0.3) ≈ exp(-0.3)
 
+    hasenbusch_shift = 0.35
+    spectrum = InfinitePE._hasenbusch_normal_spectrum(a, beta, 0, hasenbusch_shift; atol=1e-10)
+    xi_heavy = [0.4, -0.7]
+    xi_ratio = [-1.1, 0.2]
+    hasenbusch_field = (
+        heavy=Vector{Float64}(spectrum.vectors * (sqrt.(spectrum.heavy_values) .* xi_heavy)),
+        ratio=Vector{Float64}(spectrum.vectors * (sqrt.(spectrum.ratio_values) .* xi_ratio)),
+    )
+    @test two_factor_hasenbusch_pseudofermion_action(
+        a,
+        beta,
+        [hasenbusch_field];
+        shift=hasenbusch_shift,
+    ) ≈ 0.5 * (dot(xi_heavy, xi_heavy) + dot(xi_ratio, xi_ratio))
+    @test two_factor_hasenbusch_log_weight(a, beta; cutoff=cutoff, shift=hasenbusch_shift) ≈
+          log_weight(a, beta; cutoff=cutoff)
+
     lat = generate_honeycomb(2, 2, TypeI())
     input = EDMC.lattice_to_edmc(lat)
     flipped = EDMC.flip_gauge(input, 1)
@@ -120,6 +137,37 @@ end
     @test action_input ≈ action_matrix
     @test delta_pseudofermion_action(input, flipped, beta_edmc, fields_from_input) ≈
           pseudofermion_action(flipped, beta_edmc, fields_from_input) - action_input
+
+    hasenbusch_fields = refresh_two_factor_hasenbusch_pseudofermions(
+        input,
+        beta_edmc;
+        cutoff=3,
+        shift=hasenbusch_shift,
+        rng=MersenneTwister(3024),
+    )
+    @test length(hasenbusch_fields) == 3
+    @test all(field -> length(field.heavy) == lat.nsites && length(field.ratio) == lat.nsites, hasenbusch_fields)
+    @test two_factor_hasenbusch_log_weight(input, beta_edmc; cutoff=10, shift=hasenbusch_shift) ≈
+          log_weight_infinite_product(input, beta_edmc; cutoff=10)
+    hasenbusch_action = two_factor_hasenbusch_pseudofermion_action(
+        input,
+        beta_edmc,
+        hasenbusch_fields;
+        shift=hasenbusch_shift,
+    )
+    @test isfinite(hasenbusch_action)
+    @test delta_two_factor_hasenbusch_pseudofermion_action(
+        input,
+        flipped,
+        beta_edmc,
+        hasenbusch_fields;
+        shift=hasenbusch_shift,
+    ) ≈ two_factor_hasenbusch_pseudofermion_action(
+        flipped,
+        beta_edmc,
+        hasenbusch_fields;
+        shift=hasenbusch_shift,
+    ) - hasenbusch_action
 
     mc_lat = generate_honeycomb(2, 1, TypeI())
     mc_input = EDMC.lattice_to_edmc(mc_lat)
@@ -167,6 +215,8 @@ end
     @test_throws ArgumentError refresh_real_pseudofermions(a, beta; cutoff=0)
     @test_throws ArgumentError pseudofermion_action(a, beta, Vector{Float64}[])
     @test_throws ArgumentError pseudofermion_action(a, beta, [[1.0]])
+    @test_throws ArgumentError refresh_two_factor_hasenbusch_pseudofermions(a, beta; cutoff=1, shift=0.0)
+    @test_throws ArgumentError two_factor_hasenbusch_log_weight(a, beta; cutoff=0, shift=hasenbusch_shift)
     @test_throws ArgumentError run_pseudofermion_mc(mc_input, mc_beta; cutoff=0, sampling_sweeps=1)
     @test_throws ArgumentError run_pseudofermion_mc(mc_input, mc_beta; cutoff=1, sampling_sweeps=1, seed=1, rng=MersenneTwister(1))
 end

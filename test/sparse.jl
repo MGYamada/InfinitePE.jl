@@ -33,6 +33,16 @@ using SparseArrays
           sparse_pseudofermion_action(sparse_a, beta, sparse_fields; solver=:direct) atol = 1e-9
     @test sparse_pseudofermion_action(input, beta, sparse_fields) ≈
           pseudofermion_action(input, beta, sparse_fields)
+    @test InfinitePE._is_acceptable_cg_residual(1.1e-10, 1e-10)
+    @test !InfinitePE._is_acceptable_cg_residual(1.1e-9, 1e-10)
+    factorizations = InfinitePE._sparse_normal_matsubara_factorizations(sparse_a, beta, cutoff)
+    @test pure_pseudofermion_estimators(
+        sparse_a,
+        beta,
+        sparse_fields;
+        solver=:direct,
+        factorizations=factorizations,
+    ).energy ≈ pure_pseudofermion_estimators(sparse_a, beta, sparse_fields; solver=:direct).energy
 
     estimators = pure_pseudofermion_estimators(
         sparse_a,
