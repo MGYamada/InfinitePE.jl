@@ -31,7 +31,7 @@ Options:
   --pf-sampling INT                    Pseudofermion sampling sweeps per temperature [sampling]
   --pf-seed INT                        Pseudofermion RNG seed [seed]
   --pf-backend dense|sparse            Pseudofermion backend [sparse]
-  --pf-observable edmc_compatible|pure|auto
+  --pf-observable edmc_compatible|pure|determinant|auto
                                         Pseudofermion observable estimator [pure]
   --pf-solver cg|direct                Sparse pseudofermion solver [cg]
   --pf-operator matrix_free|matrix      Sparse CG normal operator [matrix_free]
@@ -384,6 +384,63 @@ function pure_pseudofermion_specific_heat_jackknife(
     return estimate, sqrt(max(0.0, variance))
 end
 
+function determinant_pseudofermion_specific_heat_jackknife(
+    input,
+    beta,
+    samples;
+    cutoff::Integer,
+    couplings=(x=1.0, y=1.0, z=1.0),
+    atol::Real=1e-10,
+)
+    isempty(samples) && throw(ArgumentError("cannot compute Jackknife error without pseudofermion samples"))
+    gauge_samples = [sample isa EDMC.Z2GaugeField ? sample : EDMC.Z2GaugeField(sample) for sample in samples]
+    nsites = input.bondset.nsites
+    energies = Float64[]
+    derivatives = Float64[]
+    sizehint!(energies, length(gauge_samples))
+    sizehint!(derivatives, length(gauge_samples))
+
+    for sample in gauge_samples
+        sample_input = EDMC.KitaevHamiltonianInput(input.bondset, sample)
+        estimator = determinant_pseudofermion_estimators(
+            sample_input,
+            beta;
+            cutoff=cutoff,
+            couplings=couplings,
+            atol=atol,
+        )
+        push!(energies, estimator.energy)
+        push!(derivatives, estimator.energy_beta_derivative)
+    end
+
+    estimate = _specific_heat_from_sums(sum(energies), sum(abs2, energies), sum(derivatives), length(energies), beta, nsites)
+    length(samples) == 1 && return estimate, 0.0
+
+    jackknife_values = Float64[]
+    sizehint!(jackknife_values, length(samples))
+    energy_sum = sum(energies)
+    energy2_sum = sum(abs2, energies)
+    derivative_sum = sum(derivatives)
+    for i in eachindex(samples)
+        push!(
+            jackknife_values,
+            _specific_heat_from_sums(
+                energy_sum - energies[i],
+                energy2_sum - abs2(energies[i]),
+                derivative_sum - derivatives[i],
+                length(samples) - 1,
+                beta,
+                nsites,
+            ),
+        )
+    end
+
+    jackknife_mean = sum(jackknife_values) / length(jackknife_values)
+    variance = (length(jackknife_values) - 1) / length(jackknife_values) *
+               sum(abs2(value - jackknife_mean) for value in jackknife_values)
+    return estimate, sqrt(max(0.0, variance))
+end
+
 function pseudofermion_specific_heat_estimate(
     input,
     beta,
@@ -419,6 +476,15 @@ function pseudofermion_specific_heat_estimate(
             tol=tol,
             maxiter=maxiter,
             krylovdim=krylovdim,
+        )
+    elseif mode === :determinant
+        return determinant_pseudofermion_specific_heat_jackknife(
+            input,
+            beta,
+            samples;
+            cutoff=cutoff,
+            couplings=couplings,
+            atol=atol,
         )
     end
     throw(ArgumentError("unsupported pseudofermion observable :$observable"))
@@ -640,7 +706,7 @@ function main(args)
         pf_sampling = get_int(opts, "pf-sampling", sampling)
         pf_seed = get_int(opts, "pf-seed", seed)
         pf_backend = get_symbol(opts, "pf-backend", :sparse, (:dense, :sparse))
-        pf_observable = get_symbol(opts, "pf-observable", :pure, (:edmc_compatible, :pure, :auto))
+        pf_observable = get_symbol(opts, "pf-observable", :pure, (:edmc_compatible, :pure, :determinant, :auto))
         pf_solver = get_symbol(opts, "pf-solver", :cg, (:cg, :direct))
         pf_operator = get_symbol(opts, "pf-operator", :matrix_free, (:matrix_free, :matrix))
         pf_tol = get_float(opts, "pf-tol", 1e-10)

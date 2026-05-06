@@ -222,9 +222,20 @@ pure pseudofermion estimator を実装する場合は、少なくとも次の値
 - `measure_pure_pseudofermion_observables(input, beta; samples, cutoff, seed, ...)`
   は EDMC と同じ gauge sample chain を受け取り、pure estimator で `EDMCObservables`
   互換の集約結果を返す。
+- `measure_determinant_pseudofermion_observables(input, beta; samples, cutoff, ...)`
+  は同じ finite cutoff の pseudofermion field を解析的に積分し、
+  `E_N=-d log W_N/d beta` と `dE_N/d beta` を trace で直接測る。これにより
+  cutoff 依存は残しつつ measurement replicas に由来する field ノイズを消せる。
+- `pure_pseudofermion_block_diagnostics(input, beta; samples, cutoff, measurement_replicas, ...)`
+  は gauge sample ごとに pseudofermion field だけを複数回 refresh し、
+  `<S_beta>_phi`, `Var_phi(S_beta | u)`, `<S_betabeta>_phi` を分けて返す。
+  pure estimator の低温不安定性が field variance と derivative の cancellation 由来か
+  を直接調べるための診断 API。
 - `pure_pseudofermion_cutoff_diagnostics(input, beta; samples, cutoffs, seed, ...)`
   は同じ gauge chain 上の EDMC-compatible 測定を基準に、cutoff ごとの bias /
-  variance / `C_pf` を比較する。
+  variance / `C_pf` を比較する。`raw_specific_heat_per_site` と
+  `variance_minus_derivative_per_site` も返すので、互換用の非負丸めで
+  `specific_heat_per_site` が 0 に張り付くケースを切り分けられる。
 - `measure_sparse_pseudofermion_mc(...; observable=:pure)` は sparse CG の pure
   estimator のみで測る。`observable=:auto` では `large_lattice_threshold` より大きい
   格子を pure estimator に切り替える。
@@ -232,6 +243,9 @@ pure pseudofermion estimator を実装する場合は、少なくとも次の値
   `--pf-measurement-replicas` で各 gauge sample あたりの pseudofermion field refresh
   数を増やす。低温側の `C_pf` はノイズで負に振れやすく、反復数が少ないと非負丸めで
   ゼロに張り付くことがある。
+- sparse MC の gauge 更新では `field_refresh=:per_attempt` と `:per_sweep` を選べる。
+  `:per_sweep` は sweep 内で同じ field を固定し、accept 後の current action を
+  更新して次の提案の基準にする。
 
 ## 注意点
 
