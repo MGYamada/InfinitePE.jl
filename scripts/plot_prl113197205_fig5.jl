@@ -38,6 +38,7 @@ Options:
   --pf-tol FLOAT                       Sparse solver tolerance [1e-10]
   --pf-maxiter INT                     Sparse solver max iterations [1000]
   --pf-krylovdim INT                   Sparse solver Krylov dimension [30]
+  --pf-hasenbusch-shifts CSV           Sparse multistage Hasenbusch shifts, e.g. 1.2,0.7,0.35,0.12 [off]
   --pf-measurement-seed INT            Pure observable RNG seed [pf-seed]
   --pf-measurement-replicas INT        Pure field refreshes per gauge sample [4]
   --large-lattice-threshold INT        Auto observable switches above this N [256]
@@ -89,6 +90,19 @@ function get_symbol(opts, key, default, allowed)
     value = Symbol(get(opts, key, string(default)))
     value in allowed || throw(ArgumentError("--$key must be one of $(join(string.(allowed), ", ")); got :$value"))
     return value
+end
+
+function get_optional_shifts(opts, key)
+    haskey(opts, key) || return nothing
+    shifts = [parse(Float64, strip(part)) for part in split(opts[key], ",") if !isempty(strip(part))]
+    isempty(shifts) && throw(ArgumentError("--$key must contain at least one shift"))
+    any(shift -> !isfinite(shift) || shift <= 0, shifts) &&
+        throw(ArgumentError("--$key shifts must be positive finite numbers"))
+    for index in 2:length(shifts)
+        shifts[index - 1] > shifts[index] ||
+            throw(ArgumentError("--$key shifts must be strictly decreasing"))
+    end
+    return shifts
 end
 
 function progress_log(enabled::Bool, message)
@@ -310,6 +324,7 @@ function pure_pseudofermion_specific_heat_jackknife(
     tol::Real=1e-10,
     maxiter::Integer=1000,
     krylovdim::Integer=30,
+    hasenbusch_shifts=nothing,
 )
     isempty(samples) && throw(ArgumentError("cannot compute Jackknife error without pseudofermion samples"))
     measurement_replicas > 0 || throw(ArgumentError("measurement_replicas must be positive; got $measurement_replicas"))
@@ -337,18 +352,42 @@ function pure_pseudofermion_specific_heat_jackknife(
         block_energy2_sum = 0.0
         block_derivative_sum = 0.0
         for _ in 1:measurement_replicas
-            fields = refresh_sparse_real_pseudofermions(matrix, beta; cutoff=cutoff, rng=rng)
-            estimator = pure_pseudofermion_estimators(
-                matrix,
-                beta,
-                fields;
-                solver=solver,
-                operator=operator,
-                tol=tol,
-                maxiter=maxiter,
-                krylovdim=krylovdim,
-                factorizations=factorizations,
-            )
+            fields = if hasenbusch_shifts === nothing
+                refresh_sparse_real_pseudofermions(matrix, beta; cutoff=cutoff, rng=rng)
+            else
+                refresh_sparse_multistage_hasenbusch_pseudofermions(
+                    matrix,
+                    beta;
+                    cutoff=cutoff,
+                    shifts=hasenbusch_shifts,
+                    rng=rng,
+                )
+            end
+            estimator = if hasenbusch_shifts === nothing
+                pure_pseudofermion_estimators(
+                    matrix,
+                    beta,
+                    fields;
+                    solver=solver,
+                    operator=operator,
+                    tol=tol,
+                    maxiter=maxiter,
+                    krylovdim=krylovdim,
+                    factorizations=factorizations,
+                )
+            else
+                hasenbusch_pure_pseudofermion_estimators(
+                    matrix,
+                    beta,
+                    fields;
+                    shifts=hasenbusch_shifts,
+                    solver=solver,
+                    operator=operator,
+                    tol=tol,
+                    maxiter=maxiter,
+                    krylovdim=krylovdim,
+                )
+            end
             push!(energies, estimator.energy)
             push!(derivatives, estimator.energy_beta_derivative)
             block_energy_sum += estimator.energy
@@ -460,6 +499,7 @@ function pseudofermion_specific_heat_estimate(
     maxiter::Integer,
     krylovdim::Integer,
     large_lattice_threshold::Integer,
+    hasenbusch_shifts=nothing,
     atol::Real=1e-10,
 )
     mode = observable === :auto && input.bondset.nsites > large_lattice_threshold ? :pure :
@@ -480,6 +520,7 @@ function pseudofermion_specific_heat_estimate(
             tol=tol,
             maxiter=maxiter,
             krylovdim=krylovdim,
+            hasenbusch_shifts=hasenbusch_shifts,
         )
     elseif mode === :determinant
         return determinant_pseudofermion_specific_heat_jackknife(
@@ -594,6 +635,7 @@ function sparse_pseudofermion_runs_with_progress(
     tol::Real,
     maxiter::Integer,
     krylovdim::Integer,
+    hasenbusch_shifts,
     progress::Bool,
 )
     rng = MersenneTwister(seed)
@@ -612,10 +654,11 @@ function sparse_pseudofermion_runs_with_progress(
             couplings=couplings,
             solver=solver,
             operator=operator,
-            tol=tol,
-            maxiter=maxiter,
-            krylovdim=krylovdim,
-        )
+                tol=tol,
+                maxiter=maxiter,
+                krylovdim=krylovdim,
+                hasenbusch_shifts=hasenbusch_shifts,
+            )
         push!(runs, run)
         current = getproperty(run, :final_input)
         progress_temperature(
@@ -716,6 +759,7 @@ function main(args)
         pf_tol = get_float(opts, "pf-tol", 1e-10)
         pf_maxiter = get_int(opts, "pf-maxiter", 1000)
         pf_krylovdim = get_int(opts, "pf-krylovdim", 30)
+        pf_hasenbusch_shifts = get_optional_shifts(opts, "pf-hasenbusch-shifts")
         pf_measurement_seed = get_int(opts, "pf-measurement-seed", pf_seed)
         pf_measurement_replicas = get_int(opts, "pf-measurement-replicas", 4)
         pf_measurement_replicas > 0 || throw(ArgumentError("--pf-measurement-replicas must be positive"))
@@ -735,6 +779,7 @@ function main(args)
                 tol=pf_tol,
                 maxiter=pf_maxiter,
                 krylovdim=pf_krylovdim,
+                hasenbusch_shifts=pf_hasenbusch_shifts,
                 progress=progress,
             )
         else
@@ -778,6 +823,7 @@ function main(args)
                     maxiter=pf_maxiter,
                     krylovdim=pf_krylovdim,
                     large_lattice_threshold=large_lattice_threshold,
+                    hasenbusch_shifts=pf_hasenbusch_shifts,
                 )
                 progress_temperature(progress, "PF-measure", i, length(temperatures), temperature, "done")
                 estimate
@@ -802,7 +848,8 @@ function main(args)
         println(
             "include_pseudofermion=$include_pseudofermion, backend=$(get(opts, "pf-backend", "sparse")), " *
             "observable=$(get(opts, "pf-observable", "pure")), cutoff=$cutoff, " *
-            "measurement_replicas=$(get(opts, "pf-measurement-replicas", "4"))",
+            "measurement_replicas=$(get(opts, "pf-measurement-replicas", "4")), " *
+            "hasenbusch_shifts=$(pf_hasenbusch_shifts === nothing ? "off" : join(pf_hasenbusch_shifts, ","))",
         )
     else
         println("include_pseudofermion=false")

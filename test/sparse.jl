@@ -33,6 +33,108 @@ using SparseArrays
           sparse_pseudofermion_action(sparse_a, beta, sparse_fields; solver=:direct) atol = 1e-9
     @test sparse_pseudofermion_action(input, beta, sparse_fields) ≈
           pseudofermion_action(input, beta, sparse_fields)
+    hasenbusch_shifts = [1.1, 0.65, 0.3, 0.1]
+    rng3 = MersenneTwister(321)
+    rng4 = MersenneTwister(321)
+    dense_hasenbusch_fields = refresh_multistage_hasenbusch_pseudofermions(
+        dense_a,
+        beta;
+        cutoff=cutoff,
+        shifts=hasenbusch_shifts,
+        rng=rng3,
+    )
+    sparse_hasenbusch_fields = refresh_sparse_multistage_hasenbusch_pseudofermions(
+        sparse_a,
+        beta;
+        cutoff=cutoff,
+        shifts=hasenbusch_shifts,
+        rng=rng4,
+    )
+    @test length(sparse_hasenbusch_fields) == length(dense_hasenbusch_fields)
+    for (sparse_field, dense_field) in zip(sparse_hasenbusch_fields, dense_hasenbusch_fields)
+        @test length(sparse_field.factors) == length(dense_field.factors)
+        for (sparse_factor, dense_factor) in zip(sparse_field.factors, dense_field.factors)
+            @test sparse_factor ≈ dense_factor
+        end
+    end
+    @test sparse_multistage_hasenbusch_pseudofermion_action(
+        sparse_a,
+        beta,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+        solver=:direct,
+    ) ≈ multistage_hasenbusch_pseudofermion_action(
+        dense_a,
+        beta,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+    )
+    @test sparse_multistage_hasenbusch_pseudofermion_action(
+        sparse_a,
+        beta,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+        solver=:cg,
+        operator=:matrix,
+    ) ≈ sparse_multistage_hasenbusch_pseudofermion_action(
+        sparse_a,
+        beta,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+        solver=:direct,
+    ) atol = 1e-9
+    @test sparse_multistage_hasenbusch_pseudofermion_action(
+        sparse_a,
+        beta,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+        solver=:cg,
+        operator=:matrix_free,
+    ) ≈ sparse_multistage_hasenbusch_pseudofermion_action(
+        sparse_a,
+        beta,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+        solver=:direct,
+    ) atol = 1e-9
+    @test sparse_multistage_hasenbusch_log_weight(sparse_a, beta; cutoff=cutoff, shifts=hasenbusch_shifts) ≈
+          multistage_hasenbusch_log_weight(dense_a, beta; cutoff=cutoff, shifts=hasenbusch_shifts)
+    @test sparse_multistage_hasenbusch_log_weight(input, beta; cutoff=cutoff, shifts=hasenbusch_shifts) ≈
+          multistage_hasenbusch_log_weight(input, beta; cutoff=cutoff, shifts=hasenbusch_shifts)
+    hasenbusch_estimators = hasenbusch_pure_pseudofermion_estimators(
+        sparse_a,
+        beta,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+        solver=:direct,
+    )
+    delta_beta_hasenbusch = 1e-5
+    hasenbusch_action_minus = sparse_multistage_hasenbusch_pseudofermion_action(
+        sparse_a,
+        beta - delta_beta_hasenbusch,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+        solver=:direct,
+    )
+    hasenbusch_action_center = sparse_multistage_hasenbusch_pseudofermion_action(
+        sparse_a,
+        beta,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+        solver=:direct,
+    )
+    hasenbusch_action_plus = sparse_multistage_hasenbusch_pseudofermion_action(
+        sparse_a,
+        beta + delta_beta_hasenbusch,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+        solver=:direct,
+    )
+    @test hasenbusch_estimators.energy ≈
+          (hasenbusch_action_plus - hasenbusch_action_minus) / (2 * delta_beta_hasenbusch) rtol = 1e-5
+    @test hasenbusch_estimators.energy_beta_derivative ≈
+          (hasenbusch_action_plus - 2 * hasenbusch_action_center + hasenbusch_action_minus) /
+          delta_beta_hasenbusch^2 rtol = 5e-3 atol = 1e-5
     @test InfinitePE._is_acceptable_cg_residual(1.1e-10, 1e-10)
     @test !InfinitePE._is_acceptable_cg_residual(1.1e-9, 1e-10)
     factorizations = InfinitePE._sparse_normal_matsubara_factorizations(sparse_a, beta, cutoff)
@@ -103,6 +205,33 @@ using SparseArrays
           delta_pseudofermion_action(dense_a, dense_after, beta, sparse_fields)
     @test delta_sparse_pseudofermion_action(input, flipped, beta, sparse_fields) ≈
           delta_pseudofermion_action(input, flipped, beta, sparse_fields)
+    @test delta_sparse_multistage_hasenbusch_pseudofermion_action(
+        sparse_a,
+        sparse_after,
+        beta,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+        solver=:direct,
+    ) ≈ delta_multistage_hasenbusch_pseudofermion_action(
+        dense_a,
+        dense_after,
+        beta,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+    )
+    @test delta_sparse_multistage_hasenbusch_pseudofermion_action(
+        input,
+        flipped,
+        beta,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+    ) ≈ delta_multistage_hasenbusch_pseudofermion_action(
+        input,
+        flipped,
+        beta,
+        sparse_hasenbusch_fields;
+        shifts=hasenbusch_shifts,
+    ) atol = 1e-9
 
     run1 = run_sparse_pseudofermion_mc(
         input,
@@ -128,6 +257,19 @@ using SparseArrays
     @test run1.final_input.gauge.u == run2.final_input.gauge.u
     @test length(run1.samples) == 2
     @test run1.attempted == 3 * length(input.bondset.bonds)
+    hasenbusch_run = run_sparse_pseudofermion_mc(
+        input,
+        beta;
+        cutoff=2,
+        warmup_sweeps=1,
+        sampling_sweeps=1,
+        seed=654,
+        solver=:cg,
+        operator=:matrix_free,
+        hasenbusch_shifts=hasenbusch_shifts,
+    )
+    @test length(hasenbusch_run.samples) == 1
+    @test hasenbusch_run.hasenbusch_shifts == Tuple(Float64.(hasenbusch_shifts))
     @test run1.accepted == run1.warmup_accepted + run1.sampling_accepted
     @test 0.0 <= run1.acceptance_rate <= 1.0
     @test run1.cutoff == 2
@@ -341,6 +483,7 @@ using SparseArrays
     @test_throws ArgumentError sparse_pseudofermion_action(sparse_a, beta, [[1.0]])
     @test_throws ArgumentError sparse_pseudofermion_action(sparse_a, beta, sparse_fields; solver=:unknown)
     @test_throws ArgumentError sparse_pseudofermion_action(sparse_a, beta, sparse_fields; operator=:unknown)
+    @test_throws ArgumentError refresh_sparse_multistage_hasenbusch_pseudofermions(sparse_a, beta; cutoff=1, shifts=[0.3, 0.3])
     @test_throws ArgumentError run_sparse_pseudofermion_mc(input, beta; cutoff=0, sampling_sweeps=1)
     @test_throws ArgumentError run_sparse_pseudofermion_mc(input, beta; cutoff=1, sampling_sweeps=1, seed=1, rng=MersenneTwister(1))
     @test_throws ArgumentError run_sparse_pseudofermion_mc(input, beta; cutoff=1, sampling_sweeps=1, field_refresh=:never)

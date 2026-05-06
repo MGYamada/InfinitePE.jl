@@ -109,6 +109,23 @@ end
     ) ≈ 0.5 * (dot(xi_heavy, xi_heavy) + dot(xi_ratio, xi_ratio))
     @test two_factor_hasenbusch_log_weight(a, beta; cutoff=cutoff, shift=hasenbusch_shift) ≈
           log_weight(a, beta; cutoff=cutoff)
+    hasenbusch_shifts = [1.2, 0.7, 0.35, 0.12]
+    multistage_spectrum = InfinitePE._hasenbusch_normal_spectrum(a, beta, 0, hasenbusch_shifts; atol=1e-10)
+    multistage_xis = [[0.4, -0.7], [-1.1, 0.2], [0.8, 0.3], [-0.5, 1.2], [0.9, -0.6]]
+    multistage_field = (
+        factors=[
+            Vector{Float64}(multistage_spectrum.vectors * (sqrt.(factor_values) .* xi))
+            for (factor_values, xi) in zip(multistage_spectrum.factor_values, multistage_xis)
+        ],
+    )
+    @test multistage_hasenbusch_pseudofermion_action(
+        a,
+        beta,
+        [multistage_field];
+        shifts=hasenbusch_shifts,
+    ) ≈ 0.5 * sum(dot(xi, xi) for xi in multistage_xis)
+    @test multistage_hasenbusch_log_weight(a, beta; cutoff=cutoff, shifts=hasenbusch_shifts) ≈
+          log_weight(a, beta; cutoff=cutoff)
 
     lat = generate_honeycomb(2, 2, TypeI())
     input = EDMC.lattice_to_edmc(lat)
@@ -149,6 +166,40 @@ end
     @test all(field -> length(field.heavy) == lat.nsites && length(field.ratio) == lat.nsites, hasenbusch_fields)
     @test two_factor_hasenbusch_log_weight(input, beta_edmc; cutoff=10, shift=hasenbusch_shift) ≈
           log_weight_infinite_product(input, beta_edmc; cutoff=10)
+    multistage_fields = refresh_multistage_hasenbusch_pseudofermions(
+        input,
+        beta_edmc;
+        cutoff=3,
+        shifts=hasenbusch_shifts,
+        rng=MersenneTwister(4024),
+    )
+    @test length(multistage_fields) == 3
+    @test all(
+        field -> length(field.factors) == length(hasenbusch_shifts) + 1 &&
+                 all(factor -> length(factor) == lat.nsites && all(isfinite, factor), field.factors),
+        multistage_fields,
+    )
+    @test multistage_hasenbusch_log_weight(input, beta_edmc; cutoff=10, shifts=hasenbusch_shifts) ≈
+          log_weight_infinite_product(input, beta_edmc; cutoff=10)
+    multistage_action = multistage_hasenbusch_pseudofermion_action(
+        input,
+        beta_edmc,
+        multistage_fields;
+        shifts=hasenbusch_shifts,
+    )
+    @test isfinite(multistage_action)
+    @test delta_multistage_hasenbusch_pseudofermion_action(
+        input,
+        flipped,
+        beta_edmc,
+        multistage_fields;
+        shifts=hasenbusch_shifts,
+    ) ≈ multistage_hasenbusch_pseudofermion_action(
+        flipped,
+        beta_edmc,
+        multistage_fields;
+        shifts=hasenbusch_shifts,
+    ) - multistage_action
     hasenbusch_action = two_factor_hasenbusch_pseudofermion_action(
         input,
         beta_edmc,
@@ -216,6 +267,7 @@ end
     @test_throws ArgumentError pseudofermion_action(a, beta, Vector{Float64}[])
     @test_throws ArgumentError pseudofermion_action(a, beta, [[1.0]])
     @test_throws ArgumentError refresh_two_factor_hasenbusch_pseudofermions(a, beta; cutoff=1, shift=0.0)
+    @test_throws ArgumentError refresh_multistage_hasenbusch_pseudofermions(a, beta; cutoff=1, shifts=[0.7, 0.7])
     @test_throws ArgumentError two_factor_hasenbusch_log_weight(a, beta; cutoff=0, shift=hasenbusch_shift)
     @test_throws ArgumentError run_pseudofermion_mc(mc_input, mc_beta; cutoff=0, sampling_sweeps=1)
     @test_throws ArgumentError run_pseudofermion_mc(mc_input, mc_beta; cutoff=1, sampling_sweeps=1, seed=1, rng=MersenneTwister(1))

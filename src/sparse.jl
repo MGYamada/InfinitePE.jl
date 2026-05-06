@@ -7,10 +7,13 @@ export build_sparse_majorana_matrix, sparse_matsubara_matrix
 export sparse_matsubara_mul, sparse_matsubara_transpose_mul
 export refresh_sparse_real_pseudofermions, sparse_pseudofermion_action
 export delta_sparse_pseudofermion_action
+export refresh_sparse_multistage_hasenbusch_pseudofermions, sparse_multistage_hasenbusch_pseudofermion_action
+export delta_sparse_multistage_hasenbusch_pseudofermion_action, sparse_multistage_hasenbusch_log_weight
 export run_sparse_pseudofermion_mc
 export measure_sparse_pseudofermion_mc, scan_sparse_pseudofermion_temperatures
 export sparse_pseudofermion_comparison_row, sparse_pseudofermion_comparison_table
-export pure_pseudofermion_estimators, measure_pure_pseudofermion_observables
+export pure_pseudofermion_estimators, hasenbusch_pure_pseudofermion_estimators
+export measure_pure_pseudofermion_observables
 export determinant_pseudofermion_estimators, measure_determinant_pseudofermion_observables
 export pure_pseudofermion_block_diagnostics
 export pure_pseudofermion_cutoff_diagnostics
@@ -288,6 +291,111 @@ function pure_pseudofermion_estimators(
 end
 
 """
+    hasenbusch_pure_pseudofermion_estimators(A, beta, fields; shifts, solver=:cg, operator=:matrix_free, ...)
+
+Evaluate pure pseudofermion energy and β-derivative estimators for fields
+sampled by [`refresh_sparse_multistage_hasenbusch_pseudofermions`](@ref).
+"""
+function hasenbusch_pure_pseudofermion_estimators(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real,
+    fields;
+    shifts,
+    solver::Symbol=:cg,
+    operator::Symbol=:matrix_free,
+    tol::Real=1e-10,
+    maxiter::Integer=1000,
+    krylovdim::Integer=30,
+)
+    _validate_beta(beta)
+    shift_values = _validate_hasenbusch_shifts(shifts)
+    _validate_sparse_majorana_matrix(matrix)
+    _validate_solver_options(solver, operator, tol, maxiter, krylovdim)
+    isempty(fields) && throw(ArgumentError("Hasenbusch field collection must be non-empty"))
+
+    energy = 0.0
+    derivative = 0.0
+    factor_specs = _hasenbusch_pure_estimator_factor_specs(shift_values)
+    for (offset, field) in enumerate(fields)
+        n = offset - 1
+        factors = _validate_hasenbusch_field_factors(field, size(matrix, 1), length(factor_specs), offset)
+        for (factor, spec) in zip(factors, factor_specs)
+            coefficient = spec.coefficient
+            shift = spec.shift
+            x = _solve_sparse_shifted_normal_for_estimator(
+                matrix,
+                beta,
+                n,
+                factor,
+                shift;
+                solver=solver,
+                operator=operator,
+                tol=tol,
+                maxiter=maxiter,
+                krylovdim=krylovdim,
+            )
+            rx = _sparse_matsubara_beta_derivative_mul(matrix, beta, n, x)
+            y = _solve_sparse_shifted_normal_for_estimator(
+                matrix,
+                beta,
+                n,
+                rx,
+                shift;
+                solver=solver,
+                operator=operator,
+                tol=tol,
+                maxiter=maxiter,
+                krylovdim=krylovdim,
+            )
+            tx = _sparse_matsubara_beta_second_derivative_mul(matrix, n, x)
+            energy += -0.5 * coefficient * dot(x, rx)
+            derivative += coefficient * dot(x, _sparse_matsubara_beta_derivative_mul(matrix, beta, n, y)) -
+                          0.5 * coefficient * dot(x, tx)
+        end
+    end
+
+    isfinite(energy) || throw(ArgumentError("Hasenbusch pure pseudofermion energy estimator is not finite"))
+    isfinite(derivative) || throw(ArgumentError("Hasenbusch pure pseudofermion derivative estimator is not finite"))
+    return (
+        energy=energy,
+        energy2=energy^2,
+        energy_beta_derivative=derivative,
+        cutoff=length(fields),
+        shifts=Tuple(shift_values),
+        solver=solver,
+        operator=operator,
+        tol=Float64(tol),
+        maxiter=Int(maxiter),
+        krylovdim=Int(krylovdim),
+    )
+end
+
+function hasenbusch_pure_pseudofermion_estimators(
+    input,
+    beta::Real,
+    fields;
+    shifts,
+    couplings=(x=1.0, y=1.0, z=1.0),
+    solver::Symbol=:cg,
+    operator::Symbol=:matrix_free,
+    tol::Real=1e-10,
+    maxiter::Integer=1000,
+    krylovdim::Integer=30,
+)
+    return hasenbusch_pure_pseudofermion_estimators(
+        build_sparse_majorana_matrix(input; couplings=couplings),
+        beta,
+        fields;
+        shifts=shifts,
+        solver=solver,
+        operator=operator,
+        tol=tol,
+        maxiter=maxiter,
+        krylovdim=krylovdim,
+    )
+end
+
+"""
     determinant_pseudofermion_estimators(A, beta; cutoff)
 
 Evaluate finite-cutoff observables after analytically integrating the
@@ -403,12 +511,14 @@ function measure_pure_pseudofermion_observables(
     tol::Real=1e-10,
     maxiter::Integer=1000,
     krylovdim::Integer=30,
+    hasenbusch_shifts=nothing,
 )
     _validate_beta(beta)
     cutoff > 0 || throw(ArgumentError("cutoff must be positive; got $cutoff"))
     measurement_replicas > 0 ||
         throw(ArgumentError("measurement_replicas must be positive; got $measurement_replicas"))
     _validate_solver_options(solver, operator, tol, maxiter, krylovdim)
+    hasenbusch_shifts === nothing || _validate_hasenbusch_shifts(hasenbusch_shifts)
     gauge_samples = _sparse_z2_gauge_samples(samples)
     local_rng = _sparse_pf_rng(seed, rng)
 
@@ -422,11 +532,22 @@ function measure_pure_pseudofermion_observables(
         sample_input = EDMC.KitaevHamiltonianInput(getproperty(input, :bondset), gauge)
         matrix = build_sparse_majorana_matrix(sample_input; couplings=couplings)
         for _ in 1:measurement_replicas
-            fields = refresh_sparse_real_pseudofermions(matrix, beta; cutoff=cutoff, rng=local_rng)
-            estimators = pure_pseudofermion_estimators(
+            fields = if hasenbusch_shifts === nothing
+                refresh_sparse_real_pseudofermions(matrix, beta; cutoff=cutoff, rng=local_rng)
+            else
+                refresh_sparse_multistage_hasenbusch_pseudofermions(
+                    matrix,
+                    beta;
+                    cutoff=cutoff,
+                    shifts=hasenbusch_shifts,
+                    rng=local_rng,
+                )
+            end
+            estimators = _pure_pseudofermion_estimators_for_fields(
                 matrix,
                 beta,
                 fields;
+                hasenbusch_shifts=hasenbusch_shifts,
                 solver=solver,
                 operator=operator,
                 tol=tol,
@@ -692,6 +813,213 @@ function sparse_pseudofermion_action(
 end
 
 """
+    refresh_sparse_multistage_hasenbusch_pseudofermions(A, beta; cutoff, shifts, rng=Random.default_rng())
+    refresh_sparse_multistage_hasenbusch_pseudofermions(input, beta; cutoff, shifts, rng=Random.default_rng(), couplings=(x=1.0, y=1.0, z=1.0))
+
+Sample multistage Hasenbusch pseudofermion fields for a sparse Majorana matrix.
+The current refresh path forms the dense normal spectrum for each Matsubara
+frequency so the factor square roots are exact; action evaluation uses sparse
+solves.
+"""
+function refresh_sparse_multistage_hasenbusch_pseudofermions(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real;
+    cutoff::Integer,
+    shifts,
+    rng::AbstractRNG=Random.default_rng(),
+)
+    return _refresh_sparse_multistage_hasenbusch_pseudofermions_with_action(
+        matrix,
+        beta;
+        cutoff=cutoff,
+        shifts=shifts,
+        rng=rng,
+    ).fields
+end
+
+function _refresh_sparse_multistage_hasenbusch_pseudofermions_with_action(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real;
+    cutoff::Integer,
+    shifts,
+    rng::AbstractRNG=Random.default_rng(),
+)
+    cutoff > 0 || throw(ArgumentError("cutoff must be positive; got $cutoff"))
+    shift_values = _validate_hasenbusch_shifts(shifts)
+    _validate_sparse_majorana_matrix(matrix)
+    dense_majorana = Matrix{Float64}(matrix)
+    fields = Vector{NamedTuple{(:factors,),Tuple{Vector{Vector{Float64}}}}}(undef, cutoff)
+    action = 0.0
+    for n in 0:(cutoff - 1)
+        spectrum = _hasenbusch_normal_spectrum(dense_majorana, beta, n, shift_values; atol=1e-10)
+        factors = Vector{Vector{Float64}}(undef, length(spectrum.factor_values))
+        for (factor_index, factor_values) in enumerate(spectrum.factor_values)
+            xi = randn(rng, size(matrix, 1))
+            action += 0.5 * dot(xi, xi)
+            factor = spectrum.vectors * (sqrt.(factor_values) .* xi)
+            factors[factor_index] = Vector{Float64}(factor)
+        end
+        fields[n + 1] = (factors=factors,)
+    end
+    isfinite(action) || throw(ArgumentError("Hasenbusch pseudofermion reference action is not finite"))
+    return (fields=fields, action=action)
+end
+
+function refresh_sparse_multistage_hasenbusch_pseudofermions(
+    input,
+    beta::Real;
+    cutoff::Integer,
+    shifts,
+    rng::AbstractRNG=Random.default_rng(),
+    couplings=(x=1.0, y=1.0, z=1.0),
+)
+    return refresh_sparse_multistage_hasenbusch_pseudofermions(
+        build_sparse_majorana_matrix(input; couplings=couplings),
+        beta;
+        cutoff=cutoff,
+        shifts=shifts,
+        rng=rng,
+    )
+end
+
+"""
+    sparse_multistage_hasenbusch_pseudofermion_action(A, beta, fields; shifts, solver=:cg, operator=:matrix_free, ...)
+
+Evaluate the multistage Hasenbusch pseudofermion action using sparse normal
+and shifted-normal solves.
+"""
+function sparse_multistage_hasenbusch_pseudofermion_action(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real,
+    fields;
+    shifts,
+    solver::Symbol=:cg,
+    operator::Symbol=:matrix_free,
+    tol::Real=1e-10,
+    maxiter::Integer=1000,
+    krylovdim::Integer=30,
+)
+    _validate_beta(beta)
+    shift_values = _validate_hasenbusch_shifts(shifts)
+    _validate_sparse_majorana_matrix(matrix)
+    _validate_solver_options(solver, operator, tol, maxiter, krylovdim)
+    isempty(fields) && throw(ArgumentError("Hasenbusch field collection must be non-empty"))
+
+    action = 0.0
+    for (offset, field) in enumerate(fields)
+        n = offset - 1
+        factors = _validate_hasenbusch_field_factors(field, size(matrix, 1), length(shift_values) + 1, offset)
+
+        first_factor = factors[1]
+        first_solve = _solve_sparse_shifted_normal_matsubara_system(
+            matrix,
+            beta,
+            n,
+            first_factor,
+            shift_values[1];
+            solver=solver,
+            operator=operator,
+            tol=tol,
+            maxiter=maxiter,
+            krylovdim=krylovdim,
+        )
+        action += 0.5 * dot(first_factor, first_solve)
+
+        for factor_index in 2:length(shift_values)
+            factor = factors[factor_index]
+            shifted_solve = _solve_sparse_shifted_normal_matsubara_system(
+                matrix,
+                beta,
+                n,
+                factor,
+                shift_values[factor_index];
+                solver=solver,
+                operator=operator,
+                tol=tol,
+                maxiter=maxiter,
+                krylovdim=krylovdim,
+            )
+            previous_mul = _sparse_shifted_normal_matsubara_mul(matrix, beta, n, shifted_solve, shift_values[factor_index - 1])
+            action += 0.5 * dot(factor, previous_mul)
+        end
+
+        last_factor = factors[end]
+        normal_solve = _solve_sparse_normal_matsubara_system(
+            matrix,
+            beta,
+            n,
+            last_factor;
+            solver=solver,
+            operator=operator,
+            tol=tol,
+            maxiter=maxiter,
+            krylovdim=krylovdim,
+        )
+        last_mul = _sparse_shifted_normal_matsubara_mul(matrix, beta, n, normal_solve, shift_values[end])
+        action += 0.5 * dot(last_factor, last_mul)
+    end
+    isfinite(action) || throw(ArgumentError("Hasenbusch pseudofermion action is not finite"))
+    return action
+end
+
+function sparse_multistage_hasenbusch_pseudofermion_action(
+    input,
+    beta::Real,
+    fields;
+    shifts,
+    couplings=(x=1.0, y=1.0, z=1.0),
+    solver::Symbol=:cg,
+    operator::Symbol=:matrix_free,
+    tol::Real=1e-10,
+    maxiter::Integer=1000,
+    krylovdim::Integer=30,
+)
+    return sparse_multistage_hasenbusch_pseudofermion_action(
+        build_sparse_majorana_matrix(input; couplings=couplings),
+        beta,
+        fields;
+        shifts=shifts,
+        solver=solver,
+        operator=operator,
+        tol=tol,
+        maxiter=maxiter,
+        krylovdim=krylovdim,
+    )
+end
+
+"""
+    sparse_multistage_hasenbusch_log_weight(A, beta; cutoff, shifts)
+    sparse_multistage_hasenbusch_log_weight(input, beta; cutoff, shifts, couplings=(x=1.0, y=1.0, z=1.0))
+
+Return the determinant log-weight represented by the multistage Hasenbusch
+split for a sparse Majorana matrix.
+"""
+function sparse_multistage_hasenbusch_log_weight(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real;
+    cutoff::Integer,
+    shifts,
+)
+    _validate_sparse_majorana_matrix(matrix)
+    return multistage_hasenbusch_log_weight(Matrix{Float64}(matrix), beta; cutoff=cutoff, shifts=shifts)
+end
+
+function sparse_multistage_hasenbusch_log_weight(
+    input,
+    beta::Real;
+    cutoff::Integer,
+    shifts,
+    couplings=(x=1.0, y=1.0, z=1.0),
+)
+    return sparse_multistage_hasenbusch_log_weight(
+        build_sparse_majorana_matrix(input; couplings=couplings),
+        beta;
+        cutoff=cutoff,
+        shifts=shifts,
+    )
+end
+
+"""
     delta_sparse_pseudofermion_action(before, after, beta, fields)
 
 Return the sparse pseudofermion action difference for fixed real
@@ -739,6 +1067,70 @@ function delta_sparse_pseudofermion_action(
     )
 end
 
+function delta_sparse_multistage_hasenbusch_pseudofermion_action(
+    before::SparseMatrixCSC{<:Real},
+    after::SparseMatrixCSC{<:Real},
+    beta::Real,
+    fields;
+    shifts,
+    solver::Symbol=:cg,
+    operator::Symbol=:matrix_free,
+    tol::Real=1e-10,
+    maxiter::Integer=1000,
+    krylovdim::Integer=30,
+)
+    size(before) == size(after) ||
+        throw(ArgumentError("matrix sizes must match; got $(size(before)) and $(size(after))"))
+    return sparse_multistage_hasenbusch_pseudofermion_action(
+        after,
+        beta,
+        fields;
+        shifts=shifts,
+        solver=solver,
+        operator=operator,
+        tol=tol,
+        maxiter=maxiter,
+        krylovdim=krylovdim,
+    ) - sparse_multistage_hasenbusch_pseudofermion_action(
+        before,
+        beta,
+        fields;
+        shifts=shifts,
+        solver=solver,
+        operator=operator,
+        tol=tol,
+        maxiter=maxiter,
+        krylovdim=krylovdim,
+    )
+end
+
+function delta_sparse_multistage_hasenbusch_pseudofermion_action(
+    before,
+    after,
+    beta::Real,
+    fields;
+    shifts,
+    couplings=(x=1.0, y=1.0, z=1.0),
+    solver::Symbol=:cg,
+    operator::Symbol=:matrix_free,
+    tol::Real=1e-10,
+    maxiter::Integer=1000,
+    krylovdim::Integer=30,
+)
+    return delta_sparse_multistage_hasenbusch_pseudofermion_action(
+        build_sparse_majorana_matrix(before; couplings=couplings),
+        build_sparse_majorana_matrix(after; couplings=couplings),
+        beta,
+        fields;
+        shifts=shifts,
+        solver=solver,
+        operator=operator,
+        tol=tol,
+        maxiter=maxiter,
+        krylovdim=krylovdim,
+    )
+end
+
 """
     run_sparse_pseudofermion_mc(input, beta; cutoff, warmup_sweeps=0, sampling_sweeps, field_refresh=:per_attempt, seed=nothing, rng=nothing, couplings=(x=1.0, y=1.0, z=1.0), solver=:cg, operator=:matrix_free)
 
@@ -763,6 +1155,7 @@ function run_sparse_pseudofermion_mc(
     tol::Real=1e-10,
     maxiter::Integer=1000,
     krylovdim::Integer=30,
+    hasenbusch_shifts=nothing,
 )
     _validate_beta(beta)
     cutoff > 0 || throw(ArgumentError("cutoff must be positive; got $cutoff"))
@@ -770,6 +1163,7 @@ function run_sparse_pseudofermion_mc(
     sampling_sweeps >= 0 || throw(ArgumentError("sampling_sweeps must be non-negative; got $sampling_sweeps"))
     _validate_field_refresh(field_refresh)
     _validate_solver_options(solver, operator, tol, maxiter, krylovdim)
+    hasenbusch_shifts === nothing || _validate_hasenbusch_shifts(hasenbusch_shifts)
     local_rng = _sparse_pf_rng(seed, rng)
 
     nbonds = length(getproperty(getproperty(input, :bondset), :bonds))
@@ -794,6 +1188,7 @@ function run_sparse_pseudofermion_mc(
             tol=tol,
             maxiter=maxiter,
             krylovdim=krylovdim,
+            hasenbusch_shifts=hasenbusch_shifts,
         )
         warmup_accepted += accepted
     end
@@ -812,6 +1207,7 @@ function run_sparse_pseudofermion_mc(
             tol=tol,
             maxiter=maxiter,
             krylovdim=krylovdim,
+            hasenbusch_shifts=hasenbusch_shifts,
         )
         sampling_accepted += accepted
         push!(samples, copy(getproperty(getproperty(current, :gauge), :u)))
@@ -839,6 +1235,7 @@ function run_sparse_pseudofermion_mc(
         tol=Float64(tol),
         maxiter=Int(maxiter),
         krylovdim=Int(krylovdim),
+        hasenbusch_shifts=hasenbusch_shifts === nothing ? nothing : Tuple(Float64.(hasenbusch_shifts)),
     )
 end
 
@@ -871,6 +1268,7 @@ function measure_sparse_pseudofermion_mc(
     krylovdim::Integer=30,
     large_lattice_threshold::Integer=256,
     atol::Real=1e-10,
+    hasenbusch_shifts=nothing,
 )
     samples = _sparse_z2_gauge_samples(getproperty(run, :samples))
     nsites = getproperty(getproperty(input, :bondset), :nsites)
@@ -884,6 +1282,9 @@ function measure_sparse_pseudofermion_mc(
         return EDMC.measure(input, beta; samples=samples, couplings=couplings, atol=atol)
     elseif mode === :pure
         resolved_cutoff = _resolve_sparse_run_option(run, cutoff, :cutoff)
+        resolved_hasenbusch_shifts = hasenbusch_shifts === nothing && hasproperty(run, :hasenbusch_shifts) ?
+                                     getproperty(run, :hasenbusch_shifts) :
+                                     hasenbusch_shifts
         return measure_pure_pseudofermion_observables(
             input,
             beta;
@@ -898,6 +1299,7 @@ function measure_sparse_pseudofermion_mc(
             tol=tol,
             maxiter=maxiter,
             krylovdim=krylovdim,
+            hasenbusch_shifts=resolved_hasenbusch_shifts,
         )
     elseif mode === :determinant
         resolved_cutoff = _resolve_sparse_run_option(run, cutoff, :cutoff)
@@ -941,12 +1343,14 @@ function scan_sparse_pseudofermion_temperatures(
     measurement_rng=nothing,
     large_lattice_threshold::Integer=256,
     atol::Real=1e-10,
+    hasenbusch_shifts=nothing,
 )
     isempty(temperatures) && throw(ArgumentError("temperature scan requires at least one temperature"))
     all(t -> isfinite(t) && t > 0, temperatures) ||
         throw(ArgumentError("all scan temperatures must be positive and finite"))
     cutoff > 0 || throw(ArgumentError("cutoff must be positive; got $cutoff"))
     _validate_field_refresh(field_refresh)
+    hasenbusch_shifts === nothing || _validate_hasenbusch_shifts(hasenbusch_shifts)
     measurement_replicas > 0 ||
         throw(ArgumentError("measurement_replicas must be positive; got $measurement_replicas"))
     _validate_solver_options(solver, operator, tol, maxiter, krylovdim)
@@ -972,6 +1376,7 @@ function scan_sparse_pseudofermion_temperatures(
             tol=tol,
             maxiter=maxiter,
             krylovdim=krylovdim,
+            hasenbusch_shifts=hasenbusch_shifts,
         )
         obs = measure_sparse_pseudofermion_mc(
             current,
@@ -1011,6 +1416,7 @@ function scan_sparse_pseudofermion_temperatures(
         krylovdim=Int(krylovdim),
         observable=observable,
         large_lattice_threshold=Int(large_lattice_threshold),
+        hasenbusch_shifts=hasenbusch_shifts === nothing ? nothing : Tuple(Float64.(hasenbusch_shifts)),
     )
 end
 
@@ -1050,6 +1456,92 @@ function sparse_pseudofermion_comparison_table(scan; metadata=NamedTuple())
     ]
 end
 
+function _refresh_sparse_pseudofermion_fields_with_action(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real;
+    cutoff::Integer,
+    rng::AbstractRNG,
+    hasenbusch_shifts,
+)
+    hasenbusch_shifts === nothing &&
+        return _refresh_sparse_real_pseudofermions_with_action(matrix, beta; cutoff=cutoff, rng=rng)
+    return _refresh_sparse_multistage_hasenbusch_pseudofermions_with_action(
+        matrix,
+        beta;
+        cutoff=cutoff,
+        shifts=hasenbusch_shifts,
+        rng=rng,
+    )
+end
+
+function _sparse_pseudofermion_action_for_fields(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real,
+    fields;
+    solver::Symbol,
+    operator::Symbol,
+    tol::Real,
+    maxiter::Integer,
+    krylovdim::Integer,
+    hasenbusch_shifts,
+)
+    hasenbusch_shifts === nothing && return sparse_pseudofermion_action(
+        matrix,
+        beta,
+        fields;
+        solver=solver,
+        operator=operator,
+        tol=tol,
+        maxiter=maxiter,
+        krylovdim=krylovdim,
+    )
+    return sparse_multistage_hasenbusch_pseudofermion_action(
+        matrix,
+        beta,
+        fields;
+        shifts=hasenbusch_shifts,
+        solver=solver,
+        operator=operator,
+        tol=tol,
+        maxiter=maxiter,
+        krylovdim=krylovdim,
+    )
+end
+
+function _pure_pseudofermion_estimators_for_fields(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real,
+    fields;
+    hasenbusch_shifts,
+    solver::Symbol,
+    operator::Symbol,
+    tol::Real,
+    maxiter::Integer,
+    krylovdim::Integer,
+)
+    hasenbusch_shifts === nothing && return pure_pseudofermion_estimators(
+        matrix,
+        beta,
+        fields;
+        solver=solver,
+        operator=operator,
+        tol=tol,
+        maxiter=maxiter,
+        krylovdim=krylovdim,
+    )
+    return hasenbusch_pure_pseudofermion_estimators(
+        matrix,
+        beta,
+        fields;
+        shifts=hasenbusch_shifts,
+        solver=solver,
+        operator=operator,
+        tol=tol,
+        maxiter=maxiter,
+        krylovdim=krylovdim,
+    )
+end
+
 function _run_sparse_pseudofermion_sweep(
     input,
     rng::AbstractRNG,
@@ -1063,22 +1555,35 @@ function _run_sparse_pseudofermion_sweep(
     tol::Real,
     maxiter::Integer,
     krylovdim::Integer,
+    hasenbusch_shifts,
 )
     current = input
     current_matrix = build_sparse_majorana_matrix(current; couplings=couplings)
     accepted = 0
     if field_refresh === :per_sweep
-        refresh = _refresh_sparse_real_pseudofermions_with_action(current_matrix, beta; cutoff=cutoff, rng=rng)
+        refresh = _refresh_sparse_pseudofermion_fields_with_action(
+            current_matrix,
+            beta;
+            cutoff=cutoff,
+            rng=rng,
+            hasenbusch_shifts=hasenbusch_shifts,
+        )
         current_action = refresh.action
     end
     for _ in 1:attempts
         if field_refresh === :per_attempt
-            refresh = _refresh_sparse_real_pseudofermions_with_action(current_matrix, beta; cutoff=cutoff, rng=rng)
+            refresh = _refresh_sparse_pseudofermion_fields_with_action(
+                current_matrix,
+                beta;
+                cutoff=cutoff,
+                rng=rng,
+                hasenbusch_shifts=hasenbusch_shifts,
+            )
             current_action = refresh.action
         end
         bond = rand(rng, 1:attempts)
         _flip_sparse_majorana_matrix!(current_matrix, current, bond; couplings=couplings)
-        proposed_action = sparse_pseudofermion_action(
+        proposed_action = _sparse_pseudofermion_action_for_fields(
             current_matrix,
             beta,
             refresh.fields;
@@ -1087,6 +1592,7 @@ function _run_sparse_pseudofermion_sweep(
             tol=tol,
             maxiter=maxiter,
             krylovdim=krylovdim,
+            hasenbusch_shifts=hasenbusch_shifts,
         )
         delta_action = proposed_action - current_action
         if rand(rng) < acceptance_probability_pseudofermion(delta_action)
@@ -1257,6 +1763,115 @@ function _solve_sparse_normal_matsubara_system(
         return x
     end
     throw(ArgumentError("unsupported sparse solver :$solver; expected :cg or :direct"))
+end
+
+function _sparse_normal_matsubara_mul(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real,
+    n::Integer,
+    vector::AbstractVector{<:Real},
+)
+    return sparse_matsubara_transpose_mul(matrix, beta, n, sparse_matsubara_mul(matrix, beta, n, vector))
+end
+
+function _sparse_shifted_normal_matsubara_mul(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real,
+    n::Integer,
+    vector::AbstractVector{<:Real},
+    shift::Real,
+)
+    _validate_hasenbusch_shift(shift)
+    return _sparse_normal_matsubara_mul(matrix, beta, n, vector) .+ Float64(shift)^2 .* Vector{Float64}(vector)
+end
+
+function _solve_sparse_shifted_normal_matsubara_system(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real,
+    n::Integer,
+    rhs::AbstractVector{<:Real},
+    shift::Real;
+    solver::Symbol,
+    operator::Symbol,
+    tol::Real,
+    maxiter::Integer,
+    krylovdim::Integer,
+)
+    _validate_hasenbusch_shift(shift)
+    if solver === :direct
+        m = sparse_matsubara_matrix(matrix, beta, n)
+        shifted = transpose(m) * m + Float64(shift)^2 * sparse(I, size(matrix, 1), size(matrix, 2))
+        return shifted \ rhs
+    end
+    if solver === :cg
+        linear_map = if operator === :matrix_free
+            vector -> _sparse_shifted_normal_matsubara_mul(matrix, beta, n, vector, shift)
+        elseif operator === :matrix
+            m = sparse_matsubara_matrix(matrix, beta, n)
+            transpose(m) * m + Float64(shift)^2 * sparse(I, size(matrix, 1), size(matrix, 2))
+        else
+            throw(ArgumentError("unsupported operator :$operator; expected :matrix_free or :matrix"))
+        end
+        x, info = linsolve(
+            linear_map,
+            Vector{Float64}(rhs),
+            zeros(Float64, length(rhs)),
+            CG(maxiter=maxiter, tol=Float64(tol), verbosity=0),
+        )
+        if info.converged <= 0 && !_is_acceptable_cg_residual(info.normres, tol)
+            throw(ArgumentError("CG did not converge; residual=$(info.normres), iterations=$(info.numiter)"))
+        end
+        return x
+    end
+    throw(ArgumentError("unsupported sparse solver :$solver; expected :cg or :direct"))
+end
+
+function _solve_sparse_shifted_normal_for_estimator(
+    matrix::SparseMatrixCSC{<:Real},
+    beta::Real,
+    n::Integer,
+    rhs::AbstractVector{<:Real},
+    shift::Real;
+    solver::Symbol,
+    operator::Symbol,
+    tol::Real,
+    maxiter::Integer,
+    krylovdim::Integer,
+)
+    iszero(shift) && return _solve_sparse_normal_matsubara_system(
+        matrix,
+        beta,
+        n,
+        rhs;
+        solver=solver,
+        operator=operator,
+        tol=tol,
+        maxiter=maxiter,
+        krylovdim=krylovdim,
+    )
+    return _solve_sparse_shifted_normal_matsubara_system(
+        matrix,
+        beta,
+        n,
+        rhs,
+        shift;
+        solver=solver,
+        operator=operator,
+        tol=tol,
+        maxiter=maxiter,
+        krylovdim=krylovdim,
+    )
+end
+
+function _hasenbusch_pure_estimator_factor_specs(shifts)
+    shift_values = _validate_hasenbusch_shifts(shifts)
+    specs = Vector{NamedTuple{(:coefficient, :shift),Tuple{Float64,Float64}}}(undef, length(shift_values) + 1)
+    specs[1] = (coefficient=1.0, shift=shift_values[1])
+    for index in 2:length(shift_values)
+        specs[index] = (coefficient=shift_values[index - 1]^2 - shift_values[index]^2, shift=shift_values[index])
+    end
+    specs[end] = (coefficient=shift_values[end]^2, shift=0.0)
+    return specs
 end
 
 function _sparse_normal_matsubara_factorizations(
